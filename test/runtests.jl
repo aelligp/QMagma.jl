@@ -1,4 +1,5 @@
 using QMagma
+using GeoParams
 using LinearAlgebra, SparseArrays, SparseDiffTools
 using Test
 
@@ -102,6 +103,16 @@ const SecYear = 3600 * 24 * 365.25
         @test all(Params.Q[ind_out] .== 0)          # zero outside the injection zone
         @test all(Params.Q[ind_zone] .> 0)          # positive heat input while Told < Tsill everywhere in zone
 
+        # host-rock advection velocity w: zero inside the zone, elastic-style decay outside
+        # (mirrors the decay law used by discrete sill injection, crack_perp_displacement)
+        ind_below = findall(z .< -Sillbot*1e3)
+        ind_above = findall(z .> -Silltop*1e3)
+        @test all(Params.w[ind_zone] .== 0)         # no relative displacement inside the zone itself
+        @test all(Params.w[ind_below] .< 0)         # pushed down below the zone
+        @test all(Params.w[ind_above] .> 0)         # pushed up above the zone
+        @test issorted(abs.(Params.w[ind_below]))            # |w| grows approaching the zone from below (z increasing)
+        @test issorted(abs.(Params.w[ind_above]), rev=true)  # |w| decays moving away from the zone above (z increasing)
+
         # heat input vanishes once the column has fully equilibrated to Tsill (ϕ=1, T=Tsill)
         Params.Told .= Tsill
         QMagma.compute_Q_magma!(Params, Params.MatParam, z; Tsill=Tsill, ȧ=ȧ, Silltop=Silltop, Sillbot=Sillbot)
@@ -150,6 +161,7 @@ const SecYear = 3600 * 24 * 365.25
             Params.Told .= T
 
             QMagma.compute_Q_magma!(Params_Q, MatParam, z; Tsill=Tsill, ȧ=ȧ, Silltop=Silltop, Sillbot=Sillbot)
+            QMagma.advect_w!(Params_Q)
             T_Q, = QMagma.nonlinear_solution(F_Q, T_Q, Jac, colors; Δ=Δ, N=N, BC=BC, Params=Params_Q, MatParam=MatParam, verbose=false)
             Params_Q.Told .= T_Q
 
@@ -158,6 +170,67 @@ const SecYear = 3600 * 24 * 365.25
 
         rel_diff = abs(maximum(T) - maximum(T_Q))/maximum(T)
         @test rel_diff < 0.01    # the two methods agree to within 1% in the many-sill limit
+    end
+
+    @testset "discrete sills vs Q_magma agree with larger, less-frequent sills (advection matters)" begin
+        H        = 40.0
+        γ        = 20.0
+        Ttop     = 0.0
+        Tbot     = Ttop + H*γ
+        nz       = floor(Int64, H*1e3/20.0)
+        Δt       = 100SecYear
+        Tsill    = 1200.0
+        Sillthick   = 100.0
+        Sill_int_yr = 1000.0
+        Silltop  = 10.0
+        Sillbot  = 20.0
+        nt       = 5000
+
+        MatParam = (SetMaterialParams(Name="RockMelt", Phase=0,
+                            Density         = ConstantDensity(ρ=2700kg/m^3),
+                            LatentHeat      = ConstantLatentHeat(Q_L=0.0J/kg),
+                            RadioactiveHeat = ExpDepthDependentRadioactiveHeat(H_0=0e-7Watt/m^3),
+                            Conductivity    = ConstantConductivity(k=3.0),
+                            HeatCapacity    = ConstantHeatCapacity(),
+                            Melting         = MeltingParam_Assimilation()
+                        ),)
+
+        Params, BC, N, Δ, T, z = QMagma.init_model(nz=nz, L=H*1e3, Geotherm=γ, Ttop=Ttop, Tbot=Tbot, Δt=Δt, MatParam=MatParam)
+        Params.Told .= T
+
+        Params_Q = deepcopy(Params)
+        T_Q      = deepcopy(T)
+        Params_Q.Told .= T_Q
+        ȧ        = Sillthick/Sill_int_yr/SecYear
+
+        rocks = zero(T)
+        nzN   = N[1]
+        J1    = Tridiagonal(ones(nzN - 1), ones(nzN), ones(nzN - 1))
+        J1[1, 2] = 0; J1[2, 1] = 0; J1[nzN-1, nzN] = 0; J1[nzN, nzN-1] = 0
+        Jac    = sparse(Float64.(abs.(J1) .> 0))
+        colors = matrix_colors(Jac)
+        F = zero(T); F_Q = zero(T_Q)
+        time = 0.0
+
+        for t in 1:nt
+            T, = QMagma.nonlinear_solution(F, T, Jac, colors; Δ=Δ, N=N, BC=BC, Params=Params, MatParam=MatParam, verbose=false)
+            if mod(time/SecYear, Sill_int_yr) == 0 && t > 1
+                Sill_z0 = rand(-Sillbot*1e3:1:-Silltop*1e3)
+                T, rocks = QMagma.insert_sill(T, rocks, z, Sill_thick=Sillthick, Sill_z0=Sill_z0, Sill_T=Tsill)
+                Params.Told .= T
+            end
+            Params.Told .= T
+
+            QMagma.compute_Q_magma!(Params_Q, MatParam, z; Tsill=Tsill, ȧ=ȧ, Silltop=Silltop, Sillbot=Sillbot)
+            QMagma.advect_w!(Params_Q)
+            T_Q, = QMagma.nonlinear_solution(F_Q, T_Q, Jac, colors; Δ=Δ, N=N, BC=BC, Params=Params_Q, MatParam=MatParam, verbose=false)
+            Params_Q.Told .= T_Q
+
+            time += Δt
+        end
+
+        rel_diff = abs(maximum(T) - maximum(T_Q))/maximum(T)
+        @test rel_diff < 0.01    # advection term keeps the two methods in close agreement
     end
 
     @testset "crack_perp_displacement" begin

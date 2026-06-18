@@ -31,6 +31,7 @@ function init_model(;nz=101, L=40e3, Geotherm=0, Ttop=400.0, Tbot=0.0, Δt=1e3*S
     ϕ           =   zeros(nz)
     Hl          =   zeros(nz)
     Q           =   zeros(nz)     # volumetric heat source term [W/m^3]
+    w           =   zeros(nz)     # vertical advection velocity [m/s]
     k           =   zeros(nz-1)
     dz          =   L/(nz-1)
     z           =   -L:dz:0
@@ -39,7 +40,7 @@ function init_model(;nz=101, L=40e3, Geotherm=0, Ttop=400.0, Tbot=0.0, Δt=1e3*S
     Phases      =   fill(0,nz)
     Phases_c    =   fill(0,nz-1)
 
-    Params      =   (; Δt, k, ρ, Cp, dϕdT, ϕ, Hl, Q, Told, Phases, Phases_c, MatParam, z)
+    Params      =   (; Δt, k, ρ, Cp, dϕdT, ϕ, Hl, Q, w, Told, Phases, Phases_c, MatParam, z)
     N           =   (nz,)
     BC          =   (; Ttop, Tbot)
     Δ           =   (dz,)
@@ -67,6 +68,8 @@ function Res!(F::AbstractVector{_T}, T::AbstractVector{_T}, Δ::NTuple, N::NTupl
 
     I          = 2:nz-1
     #  ρ(Cp + Hₗ∂ϕ/∂T) ∂T/∂t = ∂/∂z(k ∂T/∂z) + Q
+    # (host-rock advection, if any, is applied to Params.Told beforehand via a
+    # semi-Lagrangian remap - see `advect_w!` - rather than as a term here)
     F[2:end-1] = Params.ρ[I].*(Params.Cp[I]  + Params.Hl[I].*Params.dϕdT[I]).*(T[I]-Params.Told[I])/Params.Δt  -   diff(Params.k .* diff(T)/dz)/dz   .-   Params.Q[I];
 
     F[1]  = T[1]  - BC.Tbot
@@ -195,8 +198,19 @@ The first term is the sensible heat magma surrenders cooling from `Tsill` to the
 temperature; the second is the latent heat released crystallizing from ϕ=1 (injected liquid)
 down to the local melt fraction ϕ(T). ρ, cp and ϕ are (re-)evaluated here from `Params.Told`,
 consistent with how the rest of the residual is linearized.
+
+Also sets `Params.w`, the vertical advection velocity that mimics the host-rock
+displacement caused by discrete sill injection. Discrete sills use an elastic
+displacement profile (`crack_perp_displacement`, decay scale `r`) that decays away
+from the sill rather than persisting at constant amplitude far into the host rock; a
+spatially constant `w` outside the injection zone would over-advect heat into distal
+regions relative to discrete sills and bias Q_magma high. Here `w` is zero inside the
+injection zone, and outside it uses the same `crack_perp_displacement` decay law
+measured from the nearest zone edge: it peaks at `ȧ/2` right at the edge (matching the
+net accretion rate) and decays toward zero with the same length scale `r` used by
+discrete sill injection.
 """
-function compute_Q_magma!(Params, MatParam, z; Tsill, ȧ, Silltop, Sillbot)
+function compute_Q_magma!(Params, MatParam, z; Tsill, ȧ, Silltop, Sillbot, r=5e3)
     args = (T = Params.Told .+ 273.15,)
     compute_heatcapacity!(Params.Cp, MatParam, Params.Phases, args)
     compute_density!(Params.ρ, MatParam, Params.Phases, args)
@@ -208,6 +222,19 @@ function compute_Q_magma!(Params, MatParam, z; Tsill, ȧ, Silltop, Sillbot)
     Params.Q .= 0.0
     ind = findall( z .>= -Sillbot*1e3 .&& z .<= -Silltop*1e3 )
     Params.Q[ind] .= Params.ρ[ind].*(ȧ/H).*( Params.Cp[ind].*(Tsill .- Params.Told[ind]) .+ Q_L.*(1.0 .- Params.ϕ[ind]) )
+
+    # host-rock advection: elastic-style decay away from the injection zone, matching
+    # the decay law used by discrete sill injection (crack_perp_displacement). Zero
+    # inside the zone; peaks at ȧ/2 at each edge and decays outward with scale r.
+    zbot, ztop  = -Sillbot*1e3, -Silltop*1e3
+    ind_below   = findall(z .< zbot)
+    ind_above   = findall(z .> ztop)
+    dist_below  = zbot .- z          # distance below the zone (positive below zbot)
+    dist_above  = z .- ztop          # distance above the zone (positive above ztop)
+
+    Params.w .= 0.0
+    Params.w[ind_below] .= -(ȧ/2).*(1.0 .- dist_below[ind_below]./sqrt.(r^2 .+ dist_below[ind_below].^2))
+    Params.w[ind_above] .=  (ȧ/2).*(1.0 .- dist_above[ind_above]./sqrt.(r^2 .+ dist_above[ind_above].^2))
 
     return Params.Q
 end
@@ -268,6 +295,22 @@ function semilagrangian_advection(T, Displ, z)
     T_adv = interp_linear.(z)
 
     return T_adv
+end
+
+"""
+    advect_w!(Params)
+
+Semi-Lagrangian advection of `Params.Told` by the vertical velocity field `Params.w`
+[m/s] over one timestep `Params.Δt`, using the same `semilagrangian_advection` scheme
+as discrete sill injection (`insert_sill`). Mimics the host-rock displacement caused by
+continuous magma accretion (e.g. as set by `compute_Q_magma!`) in a way consistent with
+how discrete sills displace the column, rather than via an upwind advection term in the
+residual.
+"""
+function advect_w!(Params)
+    Displ = Params.w .* Params.Δt
+    Params.Told .= semilagrangian_advection(Params.Told, Displ, Params.z)
+    return Params.Told
 end
 
 
