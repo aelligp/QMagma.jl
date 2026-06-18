@@ -1,7 +1,5 @@
 # GUI for GLMakie
 using GLMakie
-GLMakie.activate!()
-GLMakie.closeall() # close any open screen
 
 export sill_intrusion_1D
 
@@ -18,6 +16,9 @@ get_valuebox(box::Vector) = parse(box[2].validator.val, box[2].stored_string.val
 Interactive GLMakie App for 1D thermal intrusion model. `size` is the size of the window in pixels.
 """
 function sill_intrusion_1D(; size=(900,900))
+    GLMakie.activate!()
+    GLMakie.closeall() # close any open screen
+
     fig = Figure(size=size)
 
     time_val = Observable(0.0)
