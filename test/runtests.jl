@@ -312,6 +312,26 @@ const SecYear = 3600 * 24 * 365.25
         @test tracers[1].phi >= 0.0   # phi now interpolated from Params.ϕ
     end
 
+    @testset "compute_zircon_ages" begin
+        time_Myr = collect(range(0.0, 0.2, length=20))
+        T_C      = collect(range(900.0, 650.0, length=20))   # monotonic cooling path
+
+        tracers = [
+            QMagma.Tracer(-10e3, T_C[end], 0.0, 1, copy(time_Myr), copy(T_C)),
+            QMagma.Tracer(-12e3, 0.0, 0.0, 0, Float64[], Float64[]),   # too few points: skipped
+        ]
+
+        result = QMagma.compute_zircon_ages(tracers; nx=30)
+        @test length(result.age_years) == 1
+        @test length(result.zircon_radius_um) == 1
+        @test result.age_years[1] > 0
+        @test result.zircon_radius_um[1] > 0
+
+        result2 = QMagma.compute_zircon_ages(tracers; nx=30, return_results=true)
+        @test length(result2.results) == 1
+        @test result2.age_years[1] ≈ QMagma.volume_averaged_age(result2.results[1])
+    end
+
     @testset "add_zone_tracers!" begin
         Silltop, Sillbot, Tsill = 10.0, 20.0, 1200.0
         tracers = QMagma.Tracer[]

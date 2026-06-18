@@ -2,7 +2,7 @@
 using GLMakie
 using JLD2
 
-export sill_intrusion_1D
+export sill_intrusion_1D, compute_zircon_ages, volume_averaged_age
 
 include("ThermalCode_1D.jl")
 
@@ -44,7 +44,7 @@ function sill_intrusion_1D(; size=(1000,1000))
     linkxaxes!(ax3, ax4)
 
     fig[1:2, 3] = grid = GridLayout(tellwidth = false)
-
+    rowgap!(grid, 2)
 
     grid[1, 1] = but            = Button(fig, label = "  RUN SIMULATION  ", buttoncolor = :lightgreen)
     grid[1, 2] = but_stop       = Button(fig, label = "  STOP  ", buttoncolor = :red)
@@ -75,11 +75,16 @@ function sill_intrusion_1D(; size=(1000,1000))
     grid[16, 1:2] = Label(fig, "Method:")
     grid[17, 1:2] = menu_method = Menu(fig, options = ["Discrete sills", "Q_magma", "Both (compare)"], default = "Both (compare)")
 
-    Box(grid[18:20, 1:2], color = (:green,0.3), cornerradius = 10 )
+    Box(grid[18:21, 1:2], color = (:green,0.3), cornerradius = 10 )
     grid[18, 1:2] = filename = [Label(fig, "filename (no extension):"), Textbox(fig, stored_string = "sim1")]
     grid[19, 1] = but_save =  Button(fig, label = "  SAVE SCREENSHOT  ", buttoncolor = (:lightgreen, 0.5))
     grid[19, 2] = but_save_data = Button(fig, label = "  SAVE DATA  ", buttoncolor = (:lightgreen, 0.5))
     grid[20, 1:2] = record_toggle = add_togglebox(fig,"Record movie:",false)
+    grid[21, 1:2] = but_zircon = Button(fig, label = "  COMPUTE ZIRCON AGES  ", buttoncolor = (:lightgreen, 0.5))
+
+    for r in 1:21
+        rowsize!(grid, r, Fixed(28))
+    end
 
     on(but_save.clicks) do n
         png_name = filename[2].stored_string.val * ".png"
@@ -100,6 +105,37 @@ function sill_intrusion_1D(; size=(1000,1000))
     on(but_stop.clicks) do n
         stop_requested[] = true
         println("Stopping simulation...")
+    end
+
+    on(but_zircon.clicks) do n
+        if isempty(tracers_out)
+            println("No tracer data yet - run the simulation first")
+        else
+            println("Computing zircon ages for $(length(tracers_out)) tracers on $(Threads.nthreads()) thread(s)...")
+            zircon_result = compute_zircon_ages(tracers_out; nx=50)
+            if !isempty(zircon_result.age_years)
+                age_ka = zircon_result.age_years ./ 1e3
+                n = length(age_ka)
+
+                zircon_fig = Figure(size=(1100,400))
+                zircon_ax  = Axis(zircon_fig[1,1], xlabel="Zircon age [years]", ylabel="Density",
+                                   title="Zircon age distribution (n=$n)")
+                density!(zircon_ax, zircon_result.age_years)
+
+                age_sorted = sort(age_ka)
+                cum_prob   = (1:n) ./ n .* 100
+                cdf_ax = Axis(zircon_fig[1,2], xlabel="Age [ka]", ylabel="Cumulative probability [%]",
+                              title="Zircon age spectrum (ranked order)")
+                stairs!(cdf_ax, age_sorted, cum_prob; step=:post)
+                ylims!(cdf_ax, 0, 100)
+
+                zircon_name = filename[2].stored_string.val * "_zircon_ages.png"
+                save(zircon_name, zircon_fig)
+                println("Saved zircon age density + cumulative probability plot to $(joinpath(pwd(), zircon_name))")
+            else
+                println("No tracers had enough recorded history to compute zircon ages; skipped zircon age plot")
+            end
+        end
     end
 
 
@@ -215,7 +251,7 @@ function sill_intrusion_1D(; size=(1000,1000))
             lines!(ax1, TQplot, z/1e3, color=:orange, linestyle=:dash, label="Q_magma")
         end
         if run_discrete && run_Qmagma
-            axislegend(ax1, position=:rb)
+            axislegend(ax1, position=:lb)
         end
         if run_discrete
             ax1.limits=(minimum(T)-10, maximum(T)+10,extrema(z/1e3)...)
@@ -414,6 +450,7 @@ function sill_intrusion_1D(; size=(1000,1000))
         global tracers_out = tracers
         global last_run_out = copy(last_run)
         println("Simulation data available in the REPL: `QMagma.tracers_out` (tracer T-t histories), `QMagma.last_run_out` (1D profiles z/T/phi vs depth, and Tmax/phimax vs time)")
+        println("Compute zircon ages with: `QMagma.compute_zircon_ages(QMagma.tracers_out)`, or click COMPUTE ZIRCON AGES")
         catch err
             @error "Simulation loop failed" exception=(err, catch_backtrace())
         end

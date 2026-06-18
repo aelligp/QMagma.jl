@@ -1,5 +1,6 @@
 using GeoParams
 using ForwardDiff, SparseArrays, SparseDiffTools, LinearAlgebra, Interpolations
+using ZirconGrowth
 
 av(x) = (x[2:end]+x[1:end-1])/2
 
@@ -457,6 +458,85 @@ function update_tracers_T!(tracers, T, z, time_Myr, phi=nothing)
         end
     end
     return tracers
+end
+
+"""
+    volume_averaged_age(result::ZirconGrowth.SimulationResult) -> Float64
+
+Compute the volume-averaged crystallisation age (in years, before the end of the
+cooling path) of a single zircon crystal, exactly as
+`MagmaThermoKinematics.volume_averaged_age` does: each concentric growth shell is
+weighted by its volume (∝ `r[i+1]^3 - r[i]^3`) and assigned the age of its midpoint;
+shells with zero or negative growth are excluded.
+"""
+function volume_averaged_age(result::ZirconGrowth.SimulationResult)
+    t = result.time_years
+    r = result.zircon_radius_um
+
+    age_sum = 0.0
+    vol_sum = 0.0
+    t_end   = t[end]
+
+    for i in 1:(length(r) - 1)
+        dV = r[i+1]^3 - r[i]^3
+        dV <= 0 && continue
+        age_mid  = t_end - 0.5*(t[i] + t[i+1])
+        age_sum += age_mid * dV
+        vol_sum += dV
+    end
+
+    return vol_sum > 0 ? age_sum / vol_sum : 0.0
+end
+
+"""
+    compute_zircon_ages(tracers; nx=100, elements=ZirconGrowth.default_element_data(),
+                         return_results=false)
+
+Run the ZirconGrowth.jl crystal-growth model on each tracer's `(time_vec, T_vec)`
+cooling path (Myr, °C) and return a `NamedTuple` with one entry per successfully
+simulated tracer (tracers with fewer than 2 recorded time steps are skipped):
+
+- `age_years`: volume-averaged crystallisation age [yr] (see [`volume_averaged_age`](@ref))
+- `zircon_radius_um`: final crystal radius [µm]
+
+Set `return_results=true` to also get the full `Vector{ZirconGrowth.SimulationResult}`.
+
+Each tracer is independent, so the loop runs on all available Julia threads
+(start Julia with `--threads auto` or `julia -t auto` for a proportional speedup;
+otherwise this runs serially and can be slow for many tracers).
+"""
+function compute_zircon_ages(tracers; nx::Int=100,
+                              elements::ZirconGrowth.ElementData=ZirconGrowth.default_element_data(),
+                              return_results::Bool=false)
+    n                = length(tracers)
+    age_years        = Vector{Union{Nothing,Float64}}(nothing, n)
+    zircon_radius_um = Vector{Union{Nothing,Float64}}(nothing, n)
+    _results         = return_results ? Vector{Union{Nothing,ZirconGrowth.SimulationResult}}(nothing, n) : nothing
+
+    Threads.@threads for i in eachindex(tracers)
+        tracer = tracers[i]
+        length(tracer.time_vec) < 2 && continue
+
+        time_Myr = Float64.(tracer.time_vec)
+        T_C      = Float64.(tracer.T_vec)
+
+        params = ZirconGrowth.GrowthParams(time_Myr, T_C; nx=nx)
+        res = ZirconGrowth.simulate_from_cooling_path(time_Myr, T_C; params=params, elements=elements)
+
+        age_years[i]        = volume_averaged_age(res)
+        zircon_radius_um[i] = res.zircon_radius_um[end]
+        return_results && (_results[i] = res)
+    end
+
+    age_years        = Float64[v for v in age_years        if !isnothing(v)]
+    zircon_radius_um = Float64[v for v in zircon_radius_um if !isnothing(v)]
+
+    if return_results
+        results = ZirconGrowth.SimulationResult[r for r in _results if !isnothing(r)]
+        return (; age_years, zircon_radius_um, results)
+    end
+
+    return (; age_years, zircon_radius_um)
 end
 
 
