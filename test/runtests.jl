@@ -249,6 +249,27 @@ const SecYear = 3600 * 24 * 365.25
         @test T_same ≈ T
     end
 
+    @testset "advect_markers!" begin
+        Params, BC, N, Δ, T, z = QMagma.init_model(nz=41, L=40e3, Geotherm=20.0,
+                                                     Ttop=0.0, Tbot=800.0, Δt=200SecYear)
+        Params.Told .= T
+
+        Tsill   = 1200.0
+        Silltop = 10.0
+        Sillbot = 20.0
+        ȧ       = 100.0/500SecYear
+
+        QMagma.compute_Q_magma!(Params, Params.MatParam, z; Tsill=Tsill, ȧ=ȧ, Silltop=Silltop, Sillbot=Sillbot)
+
+        markers = [-30e3, -15e3, -5e3]   # below, inside, and above the injection zone
+        markers0 = copy(markers)
+        QMagma.advect_markers!(markers, Params)
+
+        @test markers[1] < markers0[1]   # marker below the zone is pushed further down
+        @test markers[2] ≈ markers0[2]   # marker inside the zone (w=0) does not move
+        @test markers[3] > markers0[3]   # marker above the zone is pushed further up
+    end
+
     @testset "insert_sill" begin
         z = collect(-10e3:100.0:0.0)
         T = fill(200.0, length(z))

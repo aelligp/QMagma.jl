@@ -1,5 +1,6 @@
 # GUI for GLMakie
 using GLMakie
+using JLD2
 
 export sill_intrusion_1D
 
@@ -23,13 +24,16 @@ function sill_intrusion_1D(; size=(1000,1000))
 
     time_val = Observable(0.0)
     stop_requested = Observable(false)
+    last_run = Dict{Symbol,Any}()
 
-    Label(fig[0, 1:3], text = "1D sill injection in the crust", fontsize = 30)
+    Label(fig[0, 1:3], text = "1D Sill Injection", fontsize = 30)
 
-    ax1 =  Axis(fig[1, 1], xlabel="Temperature [ᵒC]", ylabel="Depth [km]")
-    ax2 =  Axis(fig[1, 2], xlabel="Melt fraction ϕ", title = @lift("t = $(round($time_val, digits = 2)) kyrs"))
-    ax3 =  Axis(fig[2, 1:2], xlabel="Time [kyrs]", ylabel="Maximum Temperature [ᵒC]",ytickcolor=:red,ylabelcolor=:red,yticklabelcolor=:red)
-    ax4 =  Axis(fig[2, 1:2], ylabel="Maximum melt fraction ϕ",ytickcolor=:blue,ylabelcolor=:blue,yticklabelcolor=:blue,  yaxisposition = :right)
+    fig[1:2, 1:2] = plots_fig = GridLayout()
+
+    ax1 =  Axis(plots_fig[1, 1], xlabel="Temperature [ᵒC]", ylabel="Depth [km]", title = @lift("t = $(round($time_val, digits = 2)) kyrs"))
+    ax2 =  Axis(plots_fig[1, 2], xlabel="Melt fraction ϕ")
+    ax3 =  Axis(plots_fig[2, 1:2], xlabel="Time [kyrs]", ylabel="Maximum Temperature [ᵒC]",ytickcolor=:red,ylabelcolor=:red,yticklabelcolor=:red)
+    ax4 =  Axis(plots_fig[2, 1:2], ylabel="Maximum melt fraction ϕ",ytickcolor=:blue,ylabelcolor=:blue,yticklabelcolor=:blue,  yaxisposition = :right)
 
     linkxaxes!(ax3, ax4)
 
@@ -41,7 +45,7 @@ function sill_intrusion_1D(; size=(1000,1000))
 
     Box(grid[2:4, 1:2], color = :lightgrey, cornerradius = 10)
     grid[2, 1:2] = Δz_box       = add_textbox(fig,"Grid spacing Δz [m]:",20)
-    grid[3, 1:2] = nt_box       = add_textbox(fig,"# timesteps nt:",5000)
+    grid[3, 1:2] = nt_box       = add_textbox(fig,"# timesteps nt:",3000)
     grid[4, 1:2] = Δt_yrs_box   = add_textbox(fig,"timestep Δt [yrs]:",100.0)
 
     Box(grid[5:7, 1:2], color = :lightblue, cornerradius = 10)
@@ -65,13 +69,26 @@ function sill_intrusion_1D(; size=(1000,1000))
     grid[16, 1:2] = Label(fig, "Method:")
     grid[17, 1:2] = menu_method = Menu(fig, options = ["Discrete sills", "Q_magma", "Both (compare)"], default = "Both (compare)")
 
-    Box(grid[18:19, 1:2], color = (:green,0.3), cornerradius = 10 )
-    grid[18, 1:2] = filename = [Label(fig, "filename:"), Textbox(fig, stored_string = "sim1.png")]
-    grid[19, 1:2] = but_save =  Button(fig, label = "  SAVE SCREENSHOT  ", buttoncolor = (:lightgreen, 0.5))
+    Box(grid[18:20, 1:2], color = (:green,0.3), cornerradius = 10 )
+    grid[18, 1:2] = filename = [Label(fig, "filename (no extension):"), Textbox(fig, stored_string = "sim1")]
+    grid[19, 1] = but_save =  Button(fig, label = "  SAVE SCREENSHOT  ", buttoncolor = (:lightgreen, 0.5))
+    grid[19, 2] = but_save_data = Button(fig, label = "  SAVE DATA  ", buttoncolor = (:lightgreen, 0.5))
+    grid[20, 1:2] = record_toggle = add_togglebox(fig,"Record movie:",false)
 
     on(but_save.clicks) do n
-        save(filename[2].stored_string.val, fig)
-        println("Save screenshot to $(joinpath(pwd(),filename[2].stored_string.val))")
+        png_name = filename[2].stored_string.val * ".png"
+        save(png_name, fig)
+        println("Save screenshot to $(joinpath(pwd(), png_name))")
+    end
+
+    on(but_save_data.clicks) do n
+        if isempty(last_run)
+            println("No simulation data to save yet - run the simulation first")
+        else
+            jld2_name = filename[2].stored_string.val * ".jld2"
+            jldsave(jld2_name; last_run...)
+            println("Saved data to $(joinpath(pwd(), jld2_name))")
+        end
     end
 
     on(but_stop.clicks) do n
@@ -80,7 +97,7 @@ function sill_intrusion_1D(; size=(1000,1000))
     end
 
 
-    rowsize!(fig.layout, 2, Relative(1/4))
+    rowsize!(plots_fig, 2, Relative(1/4))
 
     SecYear = 3600*24*365.25
     # Start the simulation
@@ -147,6 +164,10 @@ function sill_intrusion_1D(; size=(1000,1000))
 
         rocks = zero(T) # will later contain locations with injected sills
 
+        # injection-zone boundary markers, advected by Params_Q.w so the dashed lines
+        # on ax2 show how far the host rock at the zone edges has moved under Q_magma
+        zone_markers = [-Silltop*1e3, -Sillbot*1e3]
+
         # add initial perturbation (if any)
         T_cen =  (Silltop + Sillbot)/2*1e3
 
@@ -184,7 +205,11 @@ function sill_intrusion_1D(; size=(1000,1000))
         if run_discrete && run_Qmagma
             axislegend(ax1, position=:rb)
         end
-        ax1.limits=(minimum(T)-10, maximum(T)+10,extrema(z/1e3)...)
+        if run_discrete
+            ax1.limits=(minimum(T)-10, maximum(T)+10,extrema(z/1e3)...)
+        else
+            ax1.limits=(minimum(T)-10, Tsill+10,extrema(z/1e3)...)
+        end
         empty!(ax2)
         if run_discrete
             lines!(ax2, ϕplot,  z/1e3, color=:blue)
@@ -192,7 +217,7 @@ function sill_intrusion_1D(; size=(1000,1000))
         if run_Qmagma
             lines!(ax2, ϕQplot, z/1e3, color=:purple, linestyle=:dash)
         end
-        ax2.limits=(-1e-1,1+1e-1,extrema(z/1e3)...)
+        ax2.limits=(0,1,extrema(z/1e3)...)
         xlims!(ax3, 0, nt*Δt/SecYear/1e3)
         xlims!(ax4, 0, nt*Δt/SecYear/1e3)
 
@@ -216,9 +241,21 @@ function sill_intrusion_1D(; size=(1000,1000))
         crust_added =  Sillthick/1e3
         crust_added_numerics = sum(rocks)*Δz/1e3
         F_Q = zero(T_Q)
+
+        recording = record_toggle[2].active[]
+        movie_name = filename[2].stored_string.val * ".mp4"
+        vstream = recording ? VideoStream(fig; framerate=24) : nothing
+        if recording
+            println("Recording movie to $(joinpath(pwd(), movie_name))")
+        end
+
         @async for t = 1:nt
             if stop_requested[]
                 println("Simulation stopped at timestep $t")
+                if recording
+                    save(movie_name, vstream)
+                    println("Saved movie to $(joinpath(pwd(), movie_name))")
+                end
                 break
             end
 
@@ -244,6 +281,7 @@ function sill_intrusion_1D(; size=(1000,1000))
                 # volumetric source Q_magma instead of discrete injection events
                 compute_Q_magma!(Params_Q, MatParam, z; Tsill=Tsill, ȧ=ȧ, Silltop=Silltop, Sillbot=Sillbot)
                 advect_w!(Params_Q)   # semi-Lagrangian host-rock displacement, as with discrete sills
+                advect_markers!(zone_markers, Params_Q)
                 T_Q, converged_Q, its_Q = nonlinear_solution(F_Q, T_Q, Jac, colors, verbose=false, Δ=Δ, N=N, BC=BC, Params=Params_Q, MatParam=MatParam)
                 Params_Q.Told .= T_Q
             end
@@ -278,6 +316,7 @@ function sill_intrusion_1D(; size=(1000,1000))
                     TQplot[] = T_Q
                     ϕQplot[] = Params_Q.ϕ
                     lines!(ax2, Params_Q.ϕ, z/1e3, color=:purple, linestyle=:dash)
+                    hlines!(ax2, zone_markers./1e3, color=:black, linestyle=:dash, linewidth=1)
                 end
 
                 empty!(ax3)
@@ -288,8 +327,12 @@ function sill_intrusion_1D(; size=(1000,1000))
                 if run_Qmagma
                     lines!(ax3, time_vec, TQmax_vec, color=:orange, linestyle=:dash)
                 end
-                Tmax_all = vcat(run_discrete ? Tmax_vec : Float64[], run_Qmagma ? TQmax_vec : Float64[])
-                ylims!(ax3, minimum(Tmax_all)-10, maximum(Tmax_all)+10)
+                if run_discrete
+                    Tmax_all = vcat(Tmax_vec, run_Qmagma ? TQmax_vec : Float64[])
+                    ylims!(ax3, minimum(Tmax_all)-10, maximum(Tmax_all)+10)
+                else
+                    ylims!(ax3, minimum(TQmax_vec)-10, Tsill+10)
+                end
 
                 empty!(ax4)
                 if run_discrete
@@ -302,13 +345,38 @@ function sill_intrusion_1D(; size=(1000,1000))
                 ylims!(ax4, 0, 1.01)
 
                 println("Timestep $t, $time_kyrs kyrs, nz=$(length(T)) pts; crust added: $crust_added km")
+
+                if recording
+                    recordframe!(vstream)
+                end
             end
 
         end
 
+        if recording && !stop_requested[]
+            save(movie_name, vstream)
+            println("Saved movie to $(joinpath(pwd(), movie_name))")
+        end
+
+        empty!(last_run)
+        last_run[:z] = z
+        last_run[:time_vec] = time_vec
+        if run_discrete
+            last_run[:T] = T
+            last_run[:phi] = Params.ϕ
+            last_run[:Tmax_vec] = Tmax_vec
+            last_run[:phimax_vec] = ϕmax_vec
+        end
+        if run_Qmagma
+            last_run[:T_Qmagma] = T_Q
+            last_run[:phi_Qmagma] = Params_Q.ϕ
+            last_run[:Tmax_vec_Qmagma] = TQmax_vec
+            last_run[:phimax_vec_Qmagma] = ϕQmax_vec
+        end
+
     end
 
-    screen = display(fig)
+    screen = display(fig; title="QMagma")
 
     # center the window on the primary monitor
     try

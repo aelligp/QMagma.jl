@@ -313,6 +313,21 @@ function advect_w!(Params)
     return Params.Told
 end
 
+"""
+    advect_markers!(markers, Params)
+
+Advance a vector of passive marker depths `markers` [m] by one timestep using the
+host-rock advection velocity `Params.w` [m/s], interpolated onto the (possibly
+off-grid) marker positions. Used to visualize how far host rock outside the
+injection zone has moved under `compute_Q_magma!`/`advect_w!`, analogous to the
+`rocks` field tracked for discrete sill injection.
+"""
+function advect_markers!(markers, Params)
+    w_interp = linear_interpolation(Params.z, Params.w; extrapolation_bc=Line())
+    markers .+= w_interp.(markers) .* Params.Δt
+    return markers
+end
+
 
 
 
