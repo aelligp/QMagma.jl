@@ -29,8 +29,9 @@ function init_model(;nz=101, L=40e3, Geotherm=0, Ttop=400.0, Tbot=0.0, Δt=1e3*S
     Cp          =   zeros(nz)
     dϕdT        =   zeros(nz)
     ϕ           =   zeros(nz)
-    Hl          =   zeros(nz)    
-    k           =   zeros(nz-1)  
+    Hl          =   zeros(nz)
+    Q           =   zeros(nz)     # volumetric heat source term [W/m^3]
+    k           =   zeros(nz-1)
     dz          =   L/(nz-1)
     z           =   -L:dz:0
     T           =   -Geotherm/1e3.*Vector(z) .+ Ttop
@@ -38,7 +39,7 @@ function init_model(;nz=101, L=40e3, Geotherm=0, Ttop=400.0, Tbot=0.0, Δt=1e3*S
     Phases      =   fill(0,nz)
     Phases_c    =   fill(0,nz-1)
 
-    Params      =   (; Δt, k, ρ, Cp, dϕdT, ϕ, Hl, Told, Phases, Phases_c, MatParam, z)
+    Params      =   (; Δt, k, ρ, Cp, dϕdT, ϕ, Hl, Q, Told, Phases, Phases_c, MatParam, z)
     N           =   (nz,)
     BC          =   (; Ttop, Tbot)
     Δ           =   (dz,)
@@ -65,8 +66,8 @@ function Res!(F::AbstractVector{_T}, T::AbstractVector{_T}, Δ::NTuple, N::NTupl
     compute_latent_heat!(Params.Hl, Params.MatParam, Params.Phases, args)   
 
     I          = 2:nz-1
-    #  ρ(Cp + Hₗ∂ϕ/∂T) ∂T/∂t = ∂/∂z(k ∂T/∂z) 
-    F[2:end-1] = Params.ρ[I].*(Params.Cp[I]  + Params.Hl[I].*Params.dϕdT[I]).*(T[I]-Params.Told[I])/Params.Δt  -   diff(Params.k .* diff(T)/dz)/dz;
+    #  ρ(Cp + Hₗ∂ϕ/∂T) ∂T/∂t = ∂/∂z(k ∂T/∂z) + Q
+    F[2:end-1] = Params.ρ[I].*(Params.Cp[I]  + Params.Hl[I].*Params.dϕdT[I]).*(T[I]-Params.Told[I])/Params.Δt  -   diff(Params.k .* diff(T)/dz)/dz   .-   Params.Q[I];
 
     F[1]  = T[1]  - BC.Tbot
     F[nz] = T[nz] - BC.Ttop

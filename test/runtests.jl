@@ -55,6 +55,35 @@ const SecYear = 3600 * 24 * 365.25
         @test maximum(abs.(Tsol .- T)) < 1e-2    # steady-state geotherm barely changes
     end
 
+    @testset "source term Q heats the interior" begin
+        Params, BC, N, Δ, T, z = QMagma.init_model(nz=21, L=10e3, Geotherm=0.0,
+                                                     Ttop=0.0, Tbot=0.0, Δt=1e3SecYear)
+        Params.Told .= T
+
+        nz = N[1]
+        J1 = Tridiagonal(ones(nz - 1), ones(nz), ones(nz - 1))
+        J1[1, 2] = 0; J1[2, 1] = 0; J1[nz-1, nz] = 0; J1[nz, nz-1] = 0
+        Jac = sparse(Float64.(abs.(J1) .> 0))
+        colors = matrix_colors(Jac)
+        F = zero(T)
+
+        @test all(Params.Q .== 0)               # Q defaults to zero -> no change in behaviour
+
+        Tsol0, = QMagma.nonlinear_solution(F, copy(T), Jac, colors;
+                                            Δ=Δ, N=N, BC=BC, Params=Params,
+                                            MatParam=Params.MatParam, verbose=false)
+        @test all(Tsol0 .≈ 0.0)                  # no source, zero BCs -> stays at zero
+
+        Params.Q .= 1e-5                         # uniform volumetric heat source [W/m^3]
+        Tsol1, = QMagma.nonlinear_solution(F, copy(T), Jac, colors;
+                                            Δ=Δ, N=N, BC=BC, Params=Params,
+                                            MatParam=Params.MatParam, verbose=false)
+
+        @test all(Tsol1[2:end-1] .> Tsol0[2:end-1])  # interior heats up due to Q
+        @test Tsol1[1] ≈ BC.Tbot                     # boundary conditions still enforced
+        @test Tsol1[end] ≈ BC.Ttop
+    end
+
     @testset "crack_perp_displacement" begin
         d = 100.0
         @test QMagma.crack_perp_displacement(0.0, d) ≈ d            # max displacement at sill center
