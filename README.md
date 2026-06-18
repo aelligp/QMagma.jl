@@ -16,6 +16,10 @@ sill_intrusion_1D()
 Press `RUN SIMULATION` in the window to start the thermal model. Model parameters (grid spacing, number of timesteps, crustal geotherm, sill temperature/thickness injection interval, conductivity and melting parameterisations, ...) can be edited in the GUI before running.
 
 #### TODO:
-- [ ] Add source term computation after [Karlstrom et al. (2017)](https://www.nature.com/articles/ngeo2982) and [Mittal et al. (2021)](https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2021JB021807)
-- [ ] Add tracers (potentially reuse MTK.jl tracers here) to track temperature over time
-- [ ] Add ZirconGrowth.jl extension 
+- [x] Add source term computation after [Karlstrom et al. (2017)](https://www.nature.com/articles/ngeo2982) and [Mittal et al. (2021)](https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2021JB021807)
+- [x] Add tracers (potentially reuse MTK.jl tracers here) to track temperature over time
+- [x] Add ZirconGrowth.jl extension 
+- [x] Compute zircon ages from tracers and plot age density & cumulative probability spectra
+- [ ] Add eruption algotithm
+- [ ] Add plot of eruption volume vs time & GUI input for eruption triggers
+- [ ] Add plot of zircon ages of erupted material on plot

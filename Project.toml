@@ -16,6 +16,7 @@ ZirconGrowth = "5085b5e1-578a-4bbf-9dfc-2862bf7461c3"
 
 [compat]
 JLD2 = "0.6.4"
+ZirconGrowth = "0.1.1"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"

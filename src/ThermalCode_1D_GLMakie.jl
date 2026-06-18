@@ -114,17 +114,20 @@ function sill_intrusion_1D(; size=(1000,1000))
             println("Computing zircon ages for $(length(tracers_out)) tracers on $(Threads.nthreads()) thread(s)...")
             zircon_result = compute_zircon_ages(tracers_out; nx=50)
             if !isempty(zircon_result.age_years)
+                last_run[:zircon_age_years]    = zircon_result.age_years
+                last_run[:zircon_radius_um]    = zircon_result.zircon_radius_um
+
                 age_ka = zircon_result.age_years ./ 1e3
                 n = length(age_ka)
 
                 zircon_fig = Figure(size=(1100,400))
-                zircon_ax  = Axis(zircon_fig[1,1], xlabel="Zircon age [years]", ylabel="Density",
+                zircon_ax  = Axis(zircon_fig[1,1], xlabel="Zircon age [ka]", ylabel="Density",
                                    title="Zircon age distribution (n=$n)")
-                density!(zircon_ax, zircon_result.age_years)
+                density!(zircon_ax, age_ka)
 
                 age_sorted = sort(age_ka)
                 cum_prob   = (1:n) ./ n .* 100
-                cdf_ax = Axis(zircon_fig[1,2], xlabel="Age [ka]", ylabel="Cumulative probability [%]",
+                cdf_ax = Axis(zircon_fig[1,2], xlabel="Zircon age [ka]", ylabel="Cumulative probability [%]",
                               title="Zircon age spectrum (ranked order)")
                 stairs!(cdf_ax, age_sorted, cum_prob; step=:post)
                 ylims!(cdf_ax, 0, 100)
