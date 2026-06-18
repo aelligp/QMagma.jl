@@ -293,7 +293,7 @@ const SecYear = 3600 * 24 * 365.25
         ȧ = 100.0/500SecYear
         QMagma.compute_Q_magma!(Params, Params.MatParam, z; Tsill=Sill_T, ȧ=ȧ, Silltop=Silltop, Sillbot=Sillbot)
 
-        push!(tracers, QMagma.Tracer(-30e3, 0.0, 0, Float64[], Float64[]))  # below the zone
+        push!(tracers, QMagma.Tracer(-30e3, 0.0, 0.0, 0, Float64[], Float64[]))  # below the zone
 
         z_before = [t.z for t in tracers]
         QMagma.advect_tracers!(tracers, Params)
@@ -305,9 +305,11 @@ const SecYear = 3600 * 24 * 365.25
         @test all(t -> length(t.time_vec) == 1 && length(t.T_vec) == 1, tracers)
         @test all(t -> t.time_vec[end] == 0.001, tracers)
         @test all(t -> t.T_vec[end] == t.T, tracers)
+        @test all(t -> t.phi == 0.0, tracers[1:5])   # zone tracers' phi untouched when not passed in
 
-        QMagma.update_tracers_T!(tracers, T, z, 0.002)
+        QMagma.update_tracers_T!(tracers, T, z, 0.002, Params.ϕ)
         @test all(t -> length(t.time_vec) == 2 && length(t.T_vec) == 2, tracers)
+        @test tracers[1].phi >= 0.0   # phi now interpolated from Params.ϕ
     end
 
     @testset "add_zone_tracers!" begin
@@ -328,9 +330,9 @@ const SecYear = 3600 * 24 * 365.25
         Sill_z0, Sill_thick = -15e3, 200.0
 
         tracers = [
-            QMagma.Tracer(-15e3, 0.0, 1, Float64[], Float64[]),    # inside the sill
-            QMagma.Tracer(-10e3, 0.0, 0, Float64[], Float64[]),    # above the sill
-            QMagma.Tracer(-20e3, 0.0, 0, Float64[], Float64[]),    # below the sill
+            QMagma.Tracer(-15e3, 0.0, 0.0, 1, Float64[], Float64[]),    # inside the sill
+            QMagma.Tracer(-10e3, 0.0, 0.0, 0, Float64[], Float64[]),    # above the sill
+            QMagma.Tracer(-20e3, 0.0, 0.0, 0, Float64[], Float64[]),    # below the sill
         ]
         z0 = [t.z for t in tracers]
 
@@ -341,7 +343,7 @@ const SecYear = 3600 * 24 * 365.25
         @test tracers[3].z < z0[3]      # below the sill: pushed further down
 
         # :constant displaces by exactly ±Sill_thick outside the sill
-        tracers2 = [QMagma.Tracer(-10e3, 0.0, 0, Float64[], Float64[])]
+        tracers2 = [QMagma.Tracer(-10e3, 0.0, 0.0, 0, Float64[], Float64[])]
         QMagma.advect_tracers_sill!(tracers2, Sill_z0, Sill_thick; SillType=:constant)
         @test tracers2[1].z ≈ -10e3 + Sill_thick
     end

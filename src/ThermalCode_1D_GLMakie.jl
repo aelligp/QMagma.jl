@@ -320,9 +320,9 @@ function sill_intrusion_1D(; size=(1000,1000))
             time_Myr  = time_kyrs/1e3
 
             if track_discrete_tracers
-                update_tracers_T!(tracers, T, z, time_Myr)
+                update_tracers_T!(tracers, T, z, time_Myr, Params.ϕ)
             else
-                update_tracers_T!(tracers, T_Q, z, time_Myr)
+                update_tracers_T!(tracers, T_Q, z, time_Myr, Params_Q.ϕ)
             end
 
             push!(time_vec, time_kyrs)

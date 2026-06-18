@@ -334,11 +334,14 @@ end
 Passive tracer carrying its own temperature-time history, in the same ragged
 per-tracer-vector convention used by MagmaThermoKinematics.jl (and consumed
 directly by ZirconGrowth.jl's `simulate_from_cooling_path(time_Myr, T_C)`):
-`time_vec` is in Myr, `T_vec` and `T` are in °C.
+`time_vec` is in Myr, `T_vec` and `T` are in °C. Melt fraction `phi` (0-1) is
+tracked alongside temperature so eruptibility (whether a tracer is currently
+within the eruptible melt-fraction window) can be evaluated later.
 
 # Fields
 - `z::Float64`: current depth [m]
 - `T::Float64`: current temperature [°C]
+- `phi::Float64`: current melt fraction [-]
 - `phase::Int`: 0 = host rock, 1 = injected sill/magma material
 - `time_vec::Vector{Float64}`: recorded times [Myr], growing over the run
 - `T_vec::Vector{Float64}`: recorded temperatures [°C], growing over the run
@@ -346,6 +349,7 @@ directly by ZirconGrowth.jl's `simulate_from_cooling_path(time_Myr, T_C)`):
 mutable struct Tracer
     z        :: Float64
     T        :: Float64
+    phi      :: Float64
     phase    :: Int
     time_vec :: Vector{Float64}
     T_vec    :: Vector{Float64}
@@ -360,7 +364,7 @@ temperature-time history.
 """
 function init_tracers(Silltop, Sillbot; n=20)
     zs = range(-Sillbot*1e3, -Silltop*1e3, length=n)
-    return [Tracer(z, 0.0, 0, Float64[], Float64[]) for z in zs]
+    return [Tracer(z, 0.0, 0.0, 0, Float64[], Float64[]) for z in zs]
 end
 
 """
@@ -372,7 +376,7 @@ material), and append them to `tracers`.
 """
 function add_sill_tracers!(tracers, Sill_z0, Sill_thick, Sill_T; n=5)
     zs = range(Sill_z0 - Sill_thick/2, Sill_z0 + Sill_thick/2, length=n)
-    append!(tracers, [Tracer(z, Sill_T, 1, Float64[], Float64[]) for z in zs])
+    append!(tracers, [Tracer(z, Sill_T, 1.0, 1, Float64[], Float64[]) for z in zs])
     return tracers
 end
 
@@ -387,7 +391,7 @@ zone as the host rock is continuously advected away from its center, analogous t
 """
 function add_zone_tracers!(tracers, Silltop, Sillbot, Tsill; n=2)
     z0 = -(Silltop + Sillbot)/2*1e3
-    append!(tracers, [Tracer(z0, Tsill, 1, Float64[], Float64[]) for _ in 1:n])
+    append!(tracers, [Tracer(z0, Tsill, 1.0, 1, Float64[], Float64[]) for _ in 1:n])
     return tracers
 end
 
@@ -433,18 +437,24 @@ function advect_tracers_sill!(tracers, Sill_z0, Sill_thick; SillType=:elastic, r
 end
 
 """
-    update_tracers_T!(tracers, T, z, time_Myr)
+    update_tracers_T!(tracers, T, z, time_Myr, phi=nothing)
 
 Interpolate the temperature field `T` (defined on grid `z` [m]) onto each tracer's
 current depth, update `tracer.T`, and append `(time_Myr, tracer.T)` to the tracer's
-`time_vec`/`T_vec` history.
+`time_vec`/`T_vec` history. If the melt fraction field `phi` (on the same grid `z`)
+is given, also interpolate it onto each tracer's depth and update `tracer.phi` —
+used later to check whether a tracer is within the eruptible melt-fraction window.
 """
-function update_tracers_T!(tracers, T, z, time_Myr)
+function update_tracers_T!(tracers, T, z, time_Myr, phi=nothing)
     T_interp = linear_interpolation(z, T; extrapolation_bc=Line())
+    phi_interp = phi === nothing ? nothing : linear_interpolation(z, phi; extrapolation_bc=Line())
     for tracer in tracers
         tracer.T = T_interp(tracer.z)
         push!(tracer.time_vec, time_Myr)
         push!(tracer.T_vec, tracer.T)
+        if phi_interp !== nothing
+            tracer.phi = phi_interp(tracer.z)
+        end
     end
     return tracers
 end
