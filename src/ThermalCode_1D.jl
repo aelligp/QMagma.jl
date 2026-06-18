@@ -328,6 +328,127 @@ function advect_markers!(markers, Params)
     return markers
 end
 
+"""
+    Tracer
+
+Passive tracer carrying its own temperature-time history, in the same ragged
+per-tracer-vector convention used by MagmaThermoKinematics.jl (and consumed
+directly by ZirconGrowth.jl's `simulate_from_cooling_path(time_Myr, T_C)`):
+`time_vec` is in Myr, `T_vec` and `T` are in °C.
+
+# Fields
+- `z::Float64`: current depth [m]
+- `T::Float64`: current temperature [°C]
+- `phase::Int`: 0 = host rock, 1 = injected sill/magma material
+- `time_vec::Vector{Float64}`: recorded times [Myr], growing over the run
+- `T_vec::Vector{Float64}`: recorded temperatures [°C], growing over the run
+"""
+mutable struct Tracer
+    z        :: Float64
+    T        :: Float64
+    phase    :: Int
+    time_vec :: Vector{Float64}
+    T_vec    :: Vector{Float64}
+end
+
+"""
+    init_tracers(Silltop, Sillbot; n=20)
+
+Seed `n` passive tracers uniformly across the injection zone `z ∈ [-Sillbot, -Silltop]`
+(in km, as elsewhere in the GUI), with `phase=0` (host rock) and an as-yet-empty
+temperature-time history.
+"""
+function init_tracers(Silltop, Sillbot; n=20)
+    zs = range(-Sillbot*1e3, -Silltop*1e3, length=n)
+    return [Tracer(z, 0.0, 0, Float64[], Float64[]) for z in zs]
+end
+
+"""
+    add_sill_tracers!(tracers, Sill_z0, Sill_thick, Sill_T; n=5)
+
+Seed `n` new passive tracers within a freshly-inserted sill centered at `Sill_z0` [m]
+with thickness `Sill_thick` [m], at temperature `Sill_T` [°C] and `phase=1` (injected
+material), and append them to `tracers`.
+"""
+function add_sill_tracers!(tracers, Sill_z0, Sill_thick, Sill_T; n=5)
+    zs = range(Sill_z0 - Sill_thick/2, Sill_z0 + Sill_thick/2, length=n)
+    append!(tracers, [Tracer(z, Sill_T, 1, Float64[], Float64[]) for z in zs])
+    return tracers
+end
+
+"""
+    add_zone_tracers!(tracers, Silltop, Sillbot, Tsill; n=2)
+
+Seed `n` new passive tracers at the center of the injection zone `z ∈ [-Sillbot, -Silltop]`
+(in km), at temperature `Tsill` [°C] and `phase=1` (injected material), and append them to
+`tracers`. Used with `compute_Q_magma!`/`advect_w!` to keep replenishing tracers at the
+zone as the host rock is continuously advected away from its center, analogous to
+`add_sill_tracers!` for discrete sill injection.
+"""
+function add_zone_tracers!(tracers, Silltop, Sillbot, Tsill; n=2)
+    z0 = -(Silltop + Sillbot)/2*1e3
+    append!(tracers, [Tracer(z0, Tsill, 1, Float64[], Float64[]) for _ in 1:n])
+    return tracers
+end
+
+"""
+    advect_tracers!(tracers, Params)
+
+Advance each tracer's depth `tracer.z` by one timestep using the host-rock advection
+velocity `Params.w` [m/s], exactly as `advect_markers!` does for the injection-zone
+boundary markers. Use this for the `compute_Q_magma!`/`advect_w!` path; discrete sill
+injection does not populate `Params.w` and should use `advect_tracers_sill!` instead.
+"""
+function advect_tracers!(tracers, Params)
+    w_interp = linear_interpolation(Params.z, Params.w; extrapolation_bc=Line())
+    for tracer in tracers
+        tracer.z += w_interp(tracer.z) * Params.Δt
+    end
+    return tracers
+end
+
+"""
+    advect_tracers_sill!(tracers, Sill_z0, Sill_thick; SillType=:elastic)
+
+Displace each tracer's depth `tracer.z` by the same per-point displacement law that
+`insert_sill` applies to the temperature/rock fields when a sill of thickness
+`Sill_thick` [m] is emplaced at `Sill_z0` [m]: zero inside the sill, and
+`±crack_perp_displacement` outside it (or `±Sill_thick` for `SillType=:constant`).
+Use this for the discrete-sill path; `compute_Q_magma!`/`advect_w!` does not displace
+the column this way and should use `advect_tracers!` instead.
+"""
+function advect_tracers_sill!(tracers, Sill_z0, Sill_thick; SillType=:elastic, r=5e3)
+    for tracer in tracers
+        z_shift = tracer.z - Sill_z0
+        if abs(z_shift) <= Sill_thick/2
+            continue   # inside the sill: no host-rock displacement to apply
+        elseif SillType == :constant
+            tracer.z += z_shift > 0 ? Sill_thick : -Sill_thick
+        elseif SillType == :elastic
+            d = crack_perp_displacement(z_shift, Sill_thick; r=r)
+            tracer.z += z_shift > 0 ? d : -d
+        end
+    end
+    return tracers
+end
+
+"""
+    update_tracers_T!(tracers, T, z, time_Myr)
+
+Interpolate the temperature field `T` (defined on grid `z` [m]) onto each tracer's
+current depth, update `tracer.T`, and append `(time_Myr, tracer.T)` to the tracer's
+`time_vec`/`T_vec` history.
+"""
+function update_tracers_T!(tracers, T, z, time_Myr)
+    T_interp = linear_interpolation(z, T; extrapolation_bc=Line())
+    for tracer in tracers
+        tracer.T = T_interp(tracer.z)
+        push!(tracer.time_vec, time_Myr)
+        push!(tracer.T_vec, tracer.T)
+    end
+    return tracers
+end
+
 
 
 

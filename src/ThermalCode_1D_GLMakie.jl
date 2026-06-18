@@ -6,6 +6,12 @@ export sill_intrusion_1D
 
 include("ThermalCode_1D.jl")
 
+# populated with the latest run's data at the end of each simulation, so it's reachable
+# from the REPL: tracer T-t histories (`QMagma.tracers_out`, for ZirconGrowth.jl) and 1D
+# profiles / temporal evolution (`QMagma.last_run_out`)
+tracers_out = Tracer[]
+last_run_out = Dict{Symbol,Any}()
+
 # Few helpers: 
 add_textbox(fig, label, value) = [Label(fig, label), Textbox(fig, stored_string = string(value), validator = typeof(value))]
 add_togglebox(fig, label, active) = [Label(fig, label), Toggle(fig, active=active)]
@@ -168,6 +174,12 @@ function sill_intrusion_1D(; size=(1000,1000))
         # on ax2 show how far the host rock at the zone edges has moved under Q_magma
         zone_markers = [-Silltop*1e3, -Sillbot*1e3]
 
+        # passive tracers: discrete sills take priority when both methods run, since
+        # only one tracer set is tracked per run (advect_tracers_sill! vs advect_tracers!
+        # use unrelated displacement mechanisms and can't be mixed for the same tracers)
+        track_discrete_tracers = run_discrete
+        tracers = init_tracers(Silltop, Sillbot)
+
         # add initial perturbation (if any)
         T_cen =  (Silltop + Sillbot)/2*1e3
 
@@ -273,6 +285,11 @@ function sill_intrusion_1D(; size=(1000,1000))
                     T, rocks = insert_sill(T,rocks, z, Sill_thick=Sillthick, Sill_z0=Sill_z0, Sill_T=Tsill)
                     Params.Told .= T
 
+                    if track_discrete_tracers
+                        advect_tracers_sill!(tracers, Sill_z0, Sillthick)
+                        add_sill_tracers!(tracers, Sill_z0, Sillthick, Tsill)
+                    end
+
                     crust_added += Sillthick/1e3
                     crust_added_numerics = sum(rocks)*Δz/1e3
                     println("Injecting sill @ z=$Sill_z0")
@@ -286,12 +303,27 @@ function sill_intrusion_1D(; size=(1000,1000))
                 compute_Q_magma!(Params_Q, MatParam, z; Tsill=Tsill, ȧ=ȧ, Silltop=Silltop, Sillbot=Sillbot)
                 advect_w!(Params_Q)   # semi-Lagrangian host-rock displacement, as with discrete sills
                 advect_markers!(zone_markers, Params_Q)
+                if !track_discrete_tracers
+                    advect_tracers!(tracers, Params_Q)
+                    if mod(time/SecYear, Sill_int_yr)==0 && t>1
+                        # replenish tracers at the zone center, since host rock is
+                        # continuously advected away from it under Q_magma
+                        add_zone_tracers!(tracers, Silltop, Sillbot, Tsill)
+                    end
+                end
                 T_Q, converged_Q, its_Q = nonlinear_solution(F_Q, T_Q, Jac, colors, verbose=false, Δ=Δ, N=N, BC=BC, Params=Params_Q, MatParam=MatParam)
                 Params_Q.Told .= T_Q
             end
 
             time += Params.Δt
             time_kyrs = time/SecYear/1e3
+            time_Myr  = time_kyrs/1e3
+
+            if track_discrete_tracers
+                update_tracers_T!(tracers, T, z, time_Myr)
+            else
+                update_tracers_T!(tracers, T_Q, z, time_Myr)
+            end
 
             push!(time_vec, time_kyrs)
             if run_discrete
@@ -377,6 +409,11 @@ function sill_intrusion_1D(; size=(1000,1000))
             last_run[:Tmax_vec_Qmagma] = TQmax_vec
             last_run[:phimax_vec_Qmagma] = ϕQmax_vec
         end
+        last_run[:tracers] = tracers
+
+        global tracers_out = tracers
+        global last_run_out = copy(last_run)
+        println("Simulation data available in the REPL: `QMagma.tracers_out` (tracer T-t histories), `QMagma.last_run_out` (1D profiles z/T/phi vs depth, and Tmax/phimax vs time)")
         catch err
             @error "Simulation loop failed" exception=(err, catch_backtrace())
         end
