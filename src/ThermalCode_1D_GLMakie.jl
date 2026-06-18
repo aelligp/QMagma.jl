@@ -122,14 +122,14 @@ function sill_intrusion_1D(; size=(900,900))
 
         # setup model
         Params, BC, N, Δ, T, z = init_model(nz=nz, L=H*1e3, Geotherm=γ, Ttop=Ttop, Tbot=Tbot, Δt=Δt, MatParam=MatParam)
-        
-        #=
-        Params_anal = deepcopy(Params)  # use same parameters for analytical approximation
-        ind = findall(z.>-Sillbot*1e3 .&&   z.<-Silltop*1e3);
-        Params_anal.Q[ind] .= 5e-7      # mimic effect of dike intrusion
-        T_anal = deepcopy(T)
-        Params_anal.Told .= T_anal;
-        =#
+
+        # second model, evolved with an equivalent steady volumetric source Q_magma
+        # instead of discrete sill injection (compared side-by-side in the plots below)
+        Params_Q = deepcopy(Params)
+        T_Q      = deepcopy(T)
+        Params_Q.Told .= T_Q
+        ȧ        = Sillthick/Sill_int_yr/SecYear   # time-averaged accretion rate [m/s]
+
         rocks = zero(T) # will later contain locations with injected sills
 
         # add initial perturbation (if any)
@@ -152,15 +152,20 @@ function sill_intrusion_1D(; size=(900,900))
         timevec =Observable([0.0, 1.0])
         Tmaxvec =Observable([0.0, 1.0])
         
-        Tplot = Observable(T)
-        ϕplot = Observable(Params.ϕ)
+        Tplot   = Observable(T)
+        ϕplot   = Observable(Params.ϕ)
+        TQplot  = Observable(T_Q)
+        ϕQplot  = Observable(Params_Q.ϕ)
 
         empty!(ax1)
-        lines!(ax1, Tplot, z/1e3, color=:red)    
-        ax1.limits=(minimum(T)-10, maximum(T)+10,extrema(z/1e3)...)    
+        lines!(ax1, Tplot,  z/1e3, color=:red,   label="discrete sills")
+        lines!(ax1, TQplot, z/1e3, color=:orange, linestyle=:dash, label="Q_magma")
+        axislegend(ax1, position=:rb)
+        ax1.limits=(minimum(T)-10, maximum(T)+10,extrema(z/1e3)...)
         empty!(ax2)
-        lines!(ax2, ϕplot, z/1e3, color=:blue)
-        ax2.limits=(-1e-1,1+1e-1,extrema(z/1e3)...)    
+        lines!(ax2, ϕplot,  z/1e3, color=:blue)
+        lines!(ax2, ϕQplot, z/1e3, color=:purple, linestyle=:dash)
+        ax2.limits=(-1e-1,1+1e-1,extrema(z/1e3)...)
         xlims!(ax3, 0, nt*Δt/SecYear/1e3)
         xlims!(ax4, 0, nt*Δt/SecYear/1e3)
 
@@ -171,22 +176,25 @@ function sill_intrusion_1D(; size=(900,900))
         Jac         =   sparse(Float64.(abs.(J1).>0))
         colors      =   matrix_colors(Jac) 
 
-        time_vec = Float64[]
-        Tmax_vec = Float64[]
-        ϕmax_vec = Float64[]
-        
+        time_vec  = Float64[]
+        Tmax_vec  = Float64[]
+        ϕmax_vec  = Float64[]
+        TQmax_vec = Float64[]
+        ϕQmax_vec = Float64[]
+
         Sill_z0 = -20e3;
         println("Injecting sill @ z=$Sill_z0")
 
         # perform timestepping
         crust_added =  Sillthick/1e3
         crust_added_numerics = sum(rocks)*Δz/1e3
+        F_Q = zero(T_Q)
         @async for t = 1:nt
-        
+
             T,  converged, its = nonlinear_solution(F, T, Jac, colors, verbose=false, Δ=Δ, N=N, BC=BC, Params=Params, MatParam=MatParam)
-            
+
             if mod(time/SecYear, Sill_int_yr)==0 && t>1
-                
+
                 Sill_z0 = rand(-Sillbot*1e3:1:-Silltop*1e3)
 
                 T, rocks = insert_sill(T,rocks, z, Sill_thick=Sillthick, Sill_z0=Sill_z0, Sill_T=Tsill)
@@ -198,13 +206,11 @@ function sill_intrusion_1D(; size=(900,900))
             end
             Params.Told .= T
 
-            if 1==0
-                T_anal,  converged, its = nonlinear_solution(F, T, Jac, colors, verbose=false, Δ=Δ, N=N, BC=BC, Params=Params_anal, MatParam=MatParam)
-            
-                Params_anal.Told .= T_anal
-            end
-
-           
+            # second model: same physics, but with sills smeared into a steady
+            # volumetric source Q_magma instead of discrete injection events
+            compute_Q_magma!(Params_Q, MatParam, z; Tsill=Tsill, ȧ=ȧ, Silltop=Silltop, Sillbot=Sillbot)
+            T_Q, converged_Q, its_Q = nonlinear_solution(F_Q, T_Q, Jac, colors, verbose=false, Δ=Δ, N=N, BC=BC, Params=Params_Q, MatParam=MatParam)
+            Params_Q.Told .= T_Q
 
             time += Params.Δt
             time_kyrs = time/SecYear/1e3
@@ -212,31 +218,34 @@ function sill_intrusion_1D(; size=(900,900))
             push!(time_vec, time_kyrs)
             push!(Tmax_vec, maximum(T))
             push!(ϕmax_vec, maximum(Params.ϕ))
+            push!(TQmax_vec, maximum(T_Q))
+            push!(ϕQmax_vec, maximum(Params_Q.ϕ))
 
             # save file to disk
             if mod(t,1)==0
-                Tplot[] = T
-                ϕplot[] = Params.ϕ
+                Tplot[]  = T
+                ϕplot[]  = Params.ϕ
+                TQplot[] = T_Q
+                ϕQplot[] = Params_Q.ϕ
                 time_val[] = time_kyrs
-                #empty!(ax1)
-                #lines!(ax1, T, z/1e3, color=:red)
-                #lines!(ax1, T_anal, z/1e3, color=:green)
-                
-            
+
                 empty!(ax2)
                 rock_low  = Point2f.(zero(rocks), z/1e3)
                 rock_high = Point2f.(rocks, z/1e3)
 
                 band!(ax2, rock_low, rock_high, color=(:lightgrey,1.0))
                 lines!(ax2, Params.ϕ, z/1e3, color=:blue)
-                
+                lines!(ax2, Params_Q.ϕ, z/1e3, color=:purple, linestyle=:dash)
+
                 empty!(ax3)
                 lines!(ax3, time_vec, Tmax_vec, color=:red)
+                lines!(ax3, time_vec, TQmax_vec, color=:orange, linestyle=:dash)
                 scatter!(ax3, time_vec[end], Tmax_vec[end], color=:red)
-                ylims!(ax3, minimum(Tmax_vec)-10,maximum(Tmax_vec)+10)
+                ylims!(ax3, minimum(vcat(Tmax_vec,TQmax_vec))-10, maximum(vcat(Tmax_vec,TQmax_vec))+10)
 
                 empty!(ax4)
                 lines!(ax4, time_vec, ϕmax_vec, color=:blue)
+                lines!(ax4, time_vec, ϕQmax_vec, color=:purple, linestyle=:dash)
                 scatter!(ax4, time_vec[end], ϕmax_vec[end], color=:blue)
                 ylims!(ax4, 0, 1.01)
 
@@ -244,7 +253,7 @@ function sill_intrusion_1D(; size=(900,900))
             end
 
         end
-    
+
     end
 
     display(fig)

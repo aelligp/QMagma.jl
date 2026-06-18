@@ -181,6 +181,37 @@ function time_stepping(T, nt, Params, N, Δ, BC, MatParam; verbose=false, OutDir
     return T, Params.ϕ, time
 end
 
+"""
+    compute_Q_magma!(Params, MatParam, z; Tsill, ȧ, Silltop, Sillbot)
+
+Smears repeated sill injection into a steady volumetric heat source `Params.Q` [W/m^3],
+following
+
+    Q_magma(z,t) = ρₘ ȧ/H [ cp(Tₘ - T(z,t)) + L(1-ϕ(T)) ]
+
+over the injection zone `z ∈ [-Sillbot, -Silltop]` (in m) of thickness `H = Sillbot-Silltop`,
+and zero elsewhere. `ȧ = Sillthick/Sill_interval` is the time-averaged accretion rate [m/s].
+The first term is the sensible heat magma surrenders cooling from `Tsill` to the local
+temperature; the second is the latent heat released crystallizing from ϕ=1 (injected liquid)
+down to the local melt fraction ϕ(T). ρ, cp and ϕ are (re-)evaluated here from `Params.Told`,
+consistent with how the rest of the residual is linearized.
+"""
+function compute_Q_magma!(Params, MatParam, z; Tsill, ȧ, Silltop, Sillbot)
+    args = (T = Params.Told .+ 273.15,)
+    compute_heatcapacity!(Params.Cp, MatParam, Params.Phases, args)
+    compute_density!(Params.ρ, MatParam, Params.Phases, args)
+    compute_meltfraction!(Params.ϕ, MatParam, Params.Phases, args)
+
+    Q_L = NumValue(MatParam[1].LatentHeat[1].Q_L)
+    H   = (Sillbot - Silltop)*1e3
+
+    Params.Q .= 0.0
+    ind = findall( z .>= -Sillbot*1e3 .&& z .<= -Silltop*1e3 )
+    Params.Q[ind] .= Params.ρ[ind].*(ȧ/H).*( Params.Cp[ind].*(Tsill .- Params.Told[ind]) .+ Q_L.*(1.0 .- Params.ϕ[ind]) )
+
+    return Params.Q
+end
+
 crack_perp_displacement(z, d; r=5e3) = d.*(1.0 .- abs.(z)./(sqrt.(r^2 .+ z.^2)))
 
 """
@@ -218,7 +249,7 @@ function insert_sill(T,rocks, z; Sill_thick=400, Sill_z0=-20e3, Sill_T=1200, Sil
     ind = findall( abs.(z .- Sill_z0) .<= Sill_thick/2)
     T_adv[ind]  .= Sill_T
 
-    # use WENO5 to advect the rock field
+    # use semi-lagrangian to advect the rock field
     rock_adv = semilagrangian_advection(rocks, Displ, z)
     rock_adv[ind]  .= Sill_phase
     rock_adv    = ceil.(rock_adv)
