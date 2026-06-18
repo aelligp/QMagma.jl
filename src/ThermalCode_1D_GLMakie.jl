@@ -149,7 +149,7 @@ function sill_intrusion_1D(; size=(1000,1000))
 
     
 
-        @info "parameters" nz, H, γ, Tsill, Ttop, nz 
+        @info "parameters" nz, H, γ, Tsill, Ttop, nt 
         Tbot = Ttop +   H*γ
 
         # setup model
@@ -244,12 +244,16 @@ function sill_intrusion_1D(; size=(1000,1000))
 
         recording = record_toggle[2].active[]
         movie_name = filename[2].stored_string.val * ".mp4"
-        vstream = recording ? VideoStream(fig; framerate=24) : nothing
+        # VideoStream reconfigures the Figure's existing screen (it's the same one used for
+        # the live display); without `visible=true` it hides the window after the first
+        # recorded frame.
+        vstream = recording ? VideoStream(fig; framerate=24, visible=true) : nothing
         if recording
             println("Recording movie to $(joinpath(pwd(), movie_name))")
         end
 
-        @async for t = 1:nt
+        @async try
+        for t = 1:nt
             if stop_requested[]
                 println("Simulation stopped at timestep $t")
                 if recording
@@ -373,7 +377,9 @@ function sill_intrusion_1D(; size=(1000,1000))
             last_run[:Tmax_vec_Qmagma] = TQmax_vec
             last_run[:phimax_vec_Qmagma] = ϕQmax_vec
         end
-
+        catch err
+            @error "Simulation loop failed" exception=(err, catch_backtrace())
+        end
     end
 
     screen = display(fig; title="QMagma")
