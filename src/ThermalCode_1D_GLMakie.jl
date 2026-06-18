@@ -30,6 +30,7 @@ function sill_intrusion_1D(; size=(1000,1000))
 
     time_val = Observable(0.0)
     stop_requested = Observable(false)
+    sim_running = Observable(false)
     last_run = Dict{Symbol,Any}()
 
     Label(fig[0, 1:3], text = "1D Sill Injection", fontsize = 30)
@@ -108,35 +109,50 @@ function sill_intrusion_1D(; size=(1000,1000))
     end
 
     on(but_zircon.clicks) do n
-        if isempty(tracers_out)
+        if sim_running[]
+            println("Simulation is still finishing up - wait until it stops completely before computing zircon ages")
+        elseif isempty(tracers_out)
             println("No tracer data yet - run the simulation first")
         else
-            println("Computing zircon ages for $(length(tracers_out)) tracers on $(Threads.nthreads()) thread(s)...")
-            zircon_result = compute_zircon_ages(tracers_out; nx=50)
-            if !isempty(zircon_result.age_years)
-                last_run[:zircon_age_years]    = zircon_result.age_years
-                last_run[:zircon_radius_um]    = zircon_result.zircon_radius_um
+            # compute_zircon_ages is CPU-heavy (and itself multi-threaded via
+            # Threads.@threads), so run it off the GLMakie event thread - calling it
+            # directly from this callback can starve/destabilize the render loop and
+            # has been observed to kill the GUI window.
+            @async try
+                println("Computing zircon ages for $(length(tracers_out)) tracers on $(Threads.nthreads()) thread(s)...")
+                zircon_result = compute_zircon_ages(tracers_out; nx=50)
+                if !isempty(zircon_result.age_years)
+                    last_run[:zircon_age_years]    = zircon_result.age_years
+                    last_run[:zircon_radius_um]    = zircon_result.zircon_radius_um
 
-                age_ka = zircon_result.age_years ./ 1e3
-                n = length(age_ka)
+                    age_ka = zircon_result.age_years ./ 1e3
+                    n = length(age_ka)
 
-                zircon_fig = Figure(size=(1100,400))
-                zircon_ax  = Axis(zircon_fig[1,1], xlabel="Zircon age [ka]", ylabel="Density",
-                                   title="Zircon age distribution (n=$n)")
-                density!(zircon_ax, age_ka)
+                    zircon_fig = Figure(size=(1100,400))
+                    zircon_ax  = Axis(zircon_fig[1,1], xlabel="Zircon age [ka]", ylabel="Density",
+                                       title="Zircon age distribution (n=$n)")
+                    density!(zircon_ax, age_ka)
 
-                age_sorted = sort(age_ka)
-                cum_prob   = (1:n) ./ n .* 100
-                cdf_ax = Axis(zircon_fig[1,2], xlabel="Zircon age [ka]", ylabel="Cumulative probability [%]",
-                              title="Zircon age spectrum (ranked order)")
-                stairs!(cdf_ax, age_sorted, cum_prob; step=:post)
-                ylims!(cdf_ax, 0, 100)
+                    age_sorted = sort(age_ka)
+                    cum_prob   = (1:n) ./ n .* 100
+                    cdf_ax = Axis(zircon_fig[1,2], xlabel="Zircon age [ka]", ylabel="Cumulative probability [%]",
+                                  title="Zircon age spectrum (ranked order)")
+                    stairs!(cdf_ax, age_sorted, cum_prob; step=:post)
+                    ylims!(cdf_ax, 0, 100)
 
-                zircon_name = filename[2].stored_string.val * "_zircon_ages.png"
-                save(zircon_name, zircon_fig)
-                println("Saved zircon age density + cumulative probability plot to $(joinpath(pwd(), zircon_name))")
-            else
-                println("No tracers had enough recorded history to compute zircon ages; skipped zircon age plot")
+                    # display in its own window first: saving an undisplayed Figure
+                    # directly can make GLMakie reuse/reconfigure the main GUI's existing
+                    # screen instead of opening an independent one, replacing it on-screen.
+                    display(GLMakie.Screen(), zircon_fig; title="Zircon Ages")
+
+                    zircon_name = filename[2].stored_string.val * "_zircon_ages.png"
+                    save(zircon_name, zircon_fig)
+                    println("Saved zircon age density + cumulative probability plot to $(joinpath(pwd(), zircon_name))")
+                else
+                    println("No tracers had enough recorded history to compute zircon ages; skipped zircon age plot")
+                end
+            catch err
+                @error "Zircon age computation failed" exception=(err, catch_backtrace())
             end
         end
     end
@@ -148,6 +164,7 @@ function sill_intrusion_1D(; size=(1000,1000))
     # Start the simulation
     on(but.clicks) do n
         stop_requested[] = false
+        sim_running[] = true
         # Retrieve data from GUI
         SecYear     = 3600*24*365.25
         Δz          = get_valuebox(Δz_box)
@@ -456,6 +473,8 @@ function sill_intrusion_1D(; size=(1000,1000))
         println("Compute zircon ages with: `QMagma.compute_zircon_ages(QMagma.tracers_out)`, or click COMPUTE ZIRCON AGES")
         catch err
             @error "Simulation loop failed" exception=(err, catch_backtrace())
+        finally
+            sim_running[] = false
         end
     end
 
