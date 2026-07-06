@@ -277,10 +277,13 @@ function insert_sill(T,rocks, z; Sill_thick=400, Sill_z0=-20e3, Sill_T=1200, Sil
     ind = findall( abs.(z .- Sill_z0) .<= Sill_thick/2)
     T_adv[ind]  .= Sill_T
 
-    # use semi-lagrangian to advect the rock field
+    # move host rock and previously injected material with the same (elastic or constant)
+    # displacement as T, then re-binarize with round: interpolation leaves fractions at the
+    # 0/1 edges, and thresholding at 0.5 keeps the band from systematically inflating the
+    # way ceil (any fraction -> 1) did
     rock_adv = semilagrangian_advection(rocks, Displ, z)
     rock_adv[ind]  .= Sill_phase
-    rock_adv    = ceil.(rock_adv)
+    rock_adv    = round.(rock_adv)
 
     return T_adv, rock_adv
 end
@@ -296,6 +299,357 @@ function semilagrangian_advection(T, Displ, z)
     T_adv = interp_linear.(z)
 
     return T_adv
+end
+
+"""
+    find_eruptible_region(ϕ, z; ϕ_threshold=0.5)
+
+Find the envelope `[z_bot, z_top]` (in the grid's units, e.g. m) of the largest
+contiguous run of grid points where the melt fraction `ϕ` exceeds `ϕ_threshold`,
+anywhere in the column. Separate melt lenses are not combined: only the single
+longest contiguous run is returned, so an isolated near-threshold point far from the
+real melt zone can't inflate the reported thickness. Returns `nothing` if no point
+exceeds the threshold.
+"""
+function find_eruptible_region(ϕ, z; ϕ_threshold=0.5)
+    above = ϕ .> ϕ_threshold
+    any(above) || return nothing
+
+    best_len = 0
+    best_lo  = 0
+    best_hi  = 0
+    run_lo   = 0
+    i = 1
+    n = length(above)
+    while i <= n
+        if above[i]
+            run_lo = i
+            j = i
+            while j <= n && above[j]
+                j += 1
+            end
+            run_len = j - run_lo
+            if run_len > best_len
+                best_len = run_len
+                best_lo  = run_lo
+                best_hi  = j - 1
+            end
+            i = j
+        else
+            i += 1
+        end
+    end
+
+    return z[best_lo], z[best_hi]
+end
+
+"""
+    collapse_advection(T, z; Erupt_z0, Erupt_thick, R=Erupt_thick/2)
+
+Move every grid point's *position* toward the eruption zone `[Erupt_z0-half, Erupt_z0+half]`
+using the same elastic decay law `insert_sill` uses to open a sill (largest right at the
+band edge, decaying away from it with radius `R`), then interpolate the original field `T`
+at those moved positions back onto the fixed grid `z`. This is the direct inverse of
+`insert_sill`'s opening displacement: instead of pushing host rock apart to make room for
+new material, it pulls host rock together to close a gap left by erupted material.
+
+Points outside the band move toward `Erupt_z0` by exactly enough to fully close their side
+of the gap (not just asymptotically approach it - the naive `insert_sill`-style amplitude
+falls fractionally short once evaluated at an actual grid point rather than the idealized
+edge, which would otherwise leave a sliver of the band uncollapsed). Points inside the band
+are swept toward `Erupt_z0` too, packed into a tiny window around it so the displaced grid
+stays strictly monotonic (required for the interpolation) without colliding exactly on top
+of each other.
+"""
+function collapse_advection(T, z; Erupt_z0, Erupt_thick, R=Erupt_thick/2, method=:elastic)
+    zv = Vector(z)
+    n = length(zv)
+    half = Erupt_thick/2
+
+    Displ = collapse_displacement(zv; Erupt_z0=Erupt_z0, Erupt_thick=Erupt_thick, R=R, method=method)
+    # for the hybrid the top boundary is unpinned (the surface subsides by
+    # Erupt_thick): flat extrapolation fills the vacated cells above the subsided
+    # surface with the boundary value (Ttop)
+    itp = linear_interpolation(zv .+ Displ, Vector(T); extrapolation_bc=Flat())
+    T_new = itp.(zv)
+
+    # the handful of grid points exactly at the collapse center can still backtrace onto
+    # their own pre-collapse value due to floating-point collisions in the interpolation;
+    # patch them with a clean linear interpolation between the nearest already-correctly
+    # -advected neighbors just outside the band
+    ind = findall(abs.(zv .- Erupt_z0) .<= half)
+    if !isempty(ind) && ind[1] > 1 && ind[end] < n
+        lo, hi = ind[1]-1, ind[end]+1
+        T_new[ind] .= range(T_new[lo], T_new[hi]; length=length(ind)+2)[2:end-1]
+    end
+
+    return T_new
+end
+
+"""
+    collapse_displacement(zv; Erupt_z0, Erupt_thick, R=Erupt_thick/2, method=:elastic)
+
+Build the grid-point displacement field used by `collapse_advection` to close an
+erupted band: elastic decay away from the band edges (`crack_perp_displacement`,
+radius `R`), rescaled so the nearest exterior point on each side fully closes its
+side of the gap, with the interior (band) points packed into a tiny strictly ordered
+window around `Erupt_z0`.
+
+`method=:elastic`: both domain boundaries are pinned - the closure is fully absorbed
+by stretching the walls. `method=:hybrid`: the floor side is unchanged (elastic rise
+toward the vent), but the roof displacement transitions from `-half` at the wall face
+to a rigid `-Erupt_thick` subsidence far above (transition radius `Erupt_thick`, wide
+enough to keep the warped grid monotonic), so the free surface sinks by the erupted
+thickness and the removed volume exits through the unpinned top boundary. The
+compression paying for the floor-side stretch is thereby concentrated in the roof
+just above the vent.
+"""
+function collapse_displacement(zv; Erupt_z0, Erupt_thick, R=Erupt_thick/2, method=:elastic)
+    half = Erupt_thick/2
+    z_shift = zv .- Erupt_z0
+    Displ   = zero(z_shift)
+
+    id_above  = findall(z_shift .> half)
+    id_below  = findall(z_shift .< -half)
+    id_inside = findall(abs.(z_shift) .<= half)
+
+    dist_above = z_shift[id_above]  .- half   # distance outward from the idealized band edge
+    dist_below = -z_shift[id_below] .- half
+
+    # anchor distance: how far the nearest grid point on each side actually needs to move
+    # to fully reach Erupt_z0, used to rescale the decay law so that point's gap fully closes
+    anchor_above = isempty(id_above) ? half : z_shift[id_above[1]]
+    anchor_below = isempty(id_below) ? half : -z_shift[id_below[end]]
+    scale_above = anchor_above / crack_perp_displacement(0.0, half; r=R)
+    scale_below = anchor_below / crack_perp_displacement(0.0, half; r=R)
+
+    if method == :hybrid
+        # roof: from -half at the face (walls meet at Erupt_z0) to -Erupt_thick far
+        # above (rigid caldera subsidence of the whole overburden)
+        Displ[id_above] .= -(Erupt_thick .- crack_perp_displacement(dist_above, half; r=Erupt_thick))
+    else
+        Displ[id_above] .= -scale_above .* crack_perp_displacement(dist_above, half; r=R)
+    end
+    Displ[id_below] .=  scale_below .* crack_perp_displacement(dist_below, half; r=R)
+
+    # every point that ends up inside (or right at the edge of) the old band's footprint -
+    # both the exterior anchor points (which land exactly on Erupt_z0) and the interior
+    # (melt-zone) points - gets packed into a strictly ordered, tiny window around Erupt_z0,
+    # so the displaced grid stays strictly monotonic everywhere (required by the
+    # interpolation) without any two points colliding on the exact same position
+    id_band = sort(vcat(id_inside, isempty(id_above) ? Int[] : id_above[1], isempty(id_below) ? Int[] : id_below[end]))
+    unique!(id_band)
+    if !isempty(id_band)
+        ε = 1e-3*minimum(diff(zv))
+        order = sortperm(z_shift[id_band])   # ascending z_shift == ascending zv on id_band
+        targets = length(id_band) == 1 ? [0.0] : collect(range(-ε, ε; length=length(id_band)))
+        Displ[id_band[order]] .= targets .- z_shift[id_band[order]]
+    end
+
+    # pin the bottom boundary (fixed BC) so the warped grid never contracts past it;
+    # the top is pinned only for :elastic - for :hybrid the surface subsides and the
+    # vacated cells are filled by extrapolation in collapse_advection
+    Displ[1] = 0.0
+    if method != :hybrid
+        Displ[end] = 0.0
+    end
+
+    return Displ
+end
+
+"""
+    erupt_melt!(T, rocks, z; Erupt_z0, Erupt_thick)
+
+Erupt a melt region of thickness `Erupt_thick` [m] centered at `Erupt_z0` [m], the
+inverse of `insert_sill`. Two closure mechanisms are available via `method`:
+
+- `:caldera` (default) - roof subsidence: the erupted band's cells are deleted (the
+  magma and its heat leave the system) and the entire roof block above the band drops
+  rigidly by the band thickness onto the chamber floor, so the free surface subsides
+  by the erupted thickness. The vacated cells at the top are filled with the surface
+  temperature (the Dirichlet boundary value) - the caldera floor. No rock parcel
+  changes temperature: the roof block's profile is translated, not deformed, so the
+  column's total heat drops by exactly the erupted band's content (minus the
+  negligible cold surface fill) without any artificial cooling around the vent.
+  `rocks` subsides the same way, so `sum(rocks)` drops by exactly the erupted band's
+  grey content.
+
+- `:elastic` - elastic collapse: host rock on both sides moves toward the vent with
+  `collapse_advection`'s elastic decay law (largest at the band edges, decaying with
+  distance) and is re-interpolated onto the regular grid; `rocks` follows the same
+  displacement (re-binarized by rounding). Temperatures are transported as intensive
+  values, so the stretched walls re-cover the vent at their own temperature - the
+  column's total heat drops by much less than the erupted band's content, and
+  `sum(rocks)` drops by less than the band's grey content.
+
+- `:hybrid` - elastic + caldera: the floor rises elastically toward the vent as in
+  `:elastic`, while the roof face drops to meet it and the roof displacement
+  transitions to a rigid `-Erupt_thick` subsidence away from the vent, so the free
+  surface sinks by the erupted thickness and the removed volume exits through the
+  top. Deformation stays concentrated near the vent, temperatures are transported as
+  intensive values (no dilution cooling), and the heat debit is approximately the
+  erupted band's content (exact when the near-vent material is locally uniform: the
+  floor-side stretch duplication is paid by compression of the equally hot roof just
+  above the vent).
+"""
+function erupt_melt!(T, rocks, z; Erupt_z0, Erupt_thick, method=:caldera)
+    half = Erupt_thick/2
+    zv = Vector(z)
+    n  = length(zv)
+
+    if method == :elastic || method == :hybrid
+        T_new    = collapse_advection(Vector(T), zv; Erupt_z0=Erupt_z0, Erupt_thick=Erupt_thick, method=method)
+        rock_new = round.(collapse_advection(Vector(rocks), zv; Erupt_z0=Erupt_z0, Erupt_thick=Erupt_thick, method=method))
+        return T_new, rock_new
+    end
+
+    T_new    = copy(Vector(T))
+    rock_new = copy(Vector(rocks))
+
+    ind = findall(abs.(zv .- Erupt_z0) .<= half)
+    isempty(ind) && return T_new, rock_new
+
+    n_band = length(ind)
+    i0 = ind[1]
+    T_new[i0:n-n_band]    .= T_new[i0+n_band:n]      # roof block drops onto the floor
+    rock_new[i0:n-n_band] .= rock_new[i0+n_band:n]
+    T_new[n-n_band+1:n]    .= T_new[n]               # subsided surface, filled at Ttop
+    rock_new[n-n_band+1:n] .= 0.0
+
+    return T_new, rock_new
+end
+
+"""
+    collapse_conservative(T, z; Erupt_z0, Erupt_thick, R=Erupt_thick/2)
+
+Conservative (finite-volume) version of `collapse_advection` for the temperature
+field: instead of interpolating temperatures (which preserves the intensive value but
+lets the integrated heat grow wherever the walls stretch), the *heat content* of each
+material parcel is transported and deposited.
+
+Each grid cell is treated as a material parcel of width `Δz` carrying content
+`T*Δz`. The parcels inside the erupted band are deleted - erupted material leaves the
+system together with its heat. The surviving parcels' edges move with the same
+elastic decay law as `collapse_advection` (rescaled so the two wall faces meet
+exactly at `Erupt_z0`, with the domain-boundary edges pinned), and each parcel then
+deposits its conserved content onto the cells it overlaps. A parcel stretched to
+width `w` therefore reads a diluted temperature `T*Δz/w`: the column's total
+`Σ T Δz` drops by exactly the erupted band's content, paid by the stretched walls.
+"""
+function collapse_conservative(T, z; Erupt_z0, Erupt_thick, R=Erupt_thick/2)
+    half = Erupt_thick/2
+    zv = Vector(z)
+    n  = length(zv)
+    Δz = zv[2] - zv[1]
+
+    ind = findall(abs.(zv .- Erupt_z0) .<= half)
+    isempty(ind) && return copy(Vector(T))
+
+    # material-cell edges on the (uniform) grid
+    ze = vcat(zv .- Δz/2, zv[end] + Δz/2)
+
+    # edge displacements: elastic decay away from the wall faces (the outer edges of
+    # the deleted band), rescaled so each face lands exactly on Erupt_z0
+    De  = zeros(n+1)
+    ref = crack_perp_displacement(0.0, half; r=R)
+    j_lo = ind[1]          # edge index of the lower wall face
+    j_hi = ind[end] + 1    # edge index of the upper wall face
+    d_lo = ze[j_lo] .- ze[1:j_lo]
+    d_hi = ze[j_hi:n+1] .- ze[j_hi]
+    De[1:j_lo]   .=  (Erupt_z0 - ze[j_lo]) .* crack_perp_displacement(d_lo, half; r=R) ./ ref
+    De[j_hi:n+1] .= -(ze[j_hi] - Erupt_z0) .* crack_perp_displacement(d_hi, half; r=R) ./ ref
+    De[1]   = 0.0   # pinned domain boundaries, as in collapse_displacement
+    De[n+1] = 0.0
+    xe = ze .+ De
+
+    # deposit each surviving parcel's conserved content T*Δz onto the fixed grid
+    T_new = zeros(n)
+    for j in vcat(1:ind[1]-1, ind[end]+1:n)
+        L, Rj = xe[j], xe[j+1]
+        w = Rj - L
+        w <= 0 && continue
+        ρT = T[j]*Δz/w
+        i1 = clamp(floor(Int, (L  - ze[1])/Δz) + 1, 1, n)
+        i2 = clamp(ceil(Int,  (Rj - ze[1])/Δz),     1, n)
+        for i in i1:i2
+            ov = min(Rj, ze[i+1]) - max(L, ze[i])
+            ov > 0 && (T_new[i] += ρT*ov/Δz)
+        end
+    end
+
+    return T_new
+end
+
+"""
+    erupt_displacement(zm, Erupt_z0, Erupt_thick; method=:caldera, R=Erupt_thick/2)
+
+New position of a material point at depth `zm` under the eruption closure of
+`erupt_melt!`, for markers and tracers riding on the host rock. `:caldera`: points
+above the erupted band drop rigidly by `Erupt_thick`, points inside land on the
+chamber floor, points below stay put. `:elastic`: points inside the band collapse
+onto `Erupt_z0`, points outside move toward it with the same elastic decay law as
+the host rock in `collapse_advection`. `:hybrid`: like `:elastic` below the band,
+while above it the drop transitions from `Erupt_thick/2` at the wall face to the
+full rigid `Erupt_thick` subsidence far above the vent.
+"""
+function erupt_displacement(zm, Erupt_z0, Erupt_thick; method=:caldera, R=Erupt_thick/2)
+    half = Erupt_thick/2
+    s = zm - Erupt_z0
+    if method == :elastic
+        abs(s) <= half && return Erupt_z0
+        return zm - sign(s)*crack_perp_displacement(abs(s) - half, half; r=R)
+    elseif method == :hybrid
+        abs(s) <= half && return Erupt_z0
+        s < -half && return zm + crack_perp_displacement(-s - half, half; r=R)
+        return zm - (Erupt_thick - crack_perp_displacement(s - half, half; r=Erupt_thick))
+    end
+    zm > Erupt_z0 + half && return zm - Erupt_thick
+    zm >= Erupt_z0 - half && return Erupt_z0 - half
+    return zm
+end
+
+"""
+    collapse_markers!(markers, Erupt_z0, Erupt_thick; method=:caldera)
+
+Move marker positions (e.g. the Q_magma injection-zone boundary markers drawn in the
+melt-fraction plot) with the eruption closure, consistent with `erupt_melt!` (see
+`erupt_displacement` for the two `method`s).
+"""
+function collapse_markers!(markers, Erupt_z0, Erupt_thick; method=:caldera)
+    for (i, zm) in enumerate(markers)
+        markers[i] = erupt_displacement(zm, Erupt_z0, Erupt_thick; method=method)
+    end
+    return markers
+end
+
+"""
+    collapse_tracers!(tracers, Erupt_z0, Erupt_thick; method=:caldera)
+
+Move the passive tracers with the eruption closure, consistent with `erupt_melt!`
+(see `erupt_displacement` for the two `method`s). Tracers inside the erupted band
+should already have been removed with `extract_erupted_tracers!` - any remaining
+there are placed on the closed vent.
+"""
+function collapse_tracers!(tracers, Erupt_z0, Erupt_thick; method=:caldera)
+    for tracer in tracers
+        tracer.z = erupt_displacement(tracer.z, Erupt_z0, Erupt_thick; method=method)
+    end
+    return tracers
+end
+
+"""
+    extract_erupted_tracers!(tracers, Erupt_z0, Erupt_thick)
+
+Remove all tracers within the erupted band `[Erupt_z0 - Erupt_thick/2, Erupt_z0 + Erupt_thick/2]`
+from `tracers` (in place) and return them as a separate `Vector{Tracer}`, so zircon ages can
+be computed specifically from the population of tracers that has just erupted.
+"""
+function extract_erupted_tracers!(tracers, Erupt_z0, Erupt_thick)
+    zlo, zhi = Erupt_z0 - Erupt_thick/2, Erupt_z0 + Erupt_thick/2
+    is_erupted = [zlo <= tracer.z <= zhi for tracer in tracers]
+    erupted = tracers[is_erupted]
+    deleteat!(tracers, is_erupted)
+    return erupted
 end
 
 """

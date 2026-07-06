@@ -7,24 +7,48 @@ export sill_intrusion_1D, compute_zircon_ages, volume_averaged_age
 include("ThermalCode_1D.jl")
 
 # populated with the latest run's data at the end of each simulation, so it's reachable
-# from the REPL: tracer T-t histories (`QMagma.tracers_out`, for ZirconGrowth.jl) and 1D
-# profiles / temporal evolution (`QMagma.last_run_out`)
+# from the REPL: tracer T-t histories (`QMagma.tracers_out`, for ZirconGrowth.jl), tracers
+# removed by eruption (`QMagma.erupted_tracers_out`), and 1D profiles / temporal evolution
+# (`QMagma.last_run_out`)
 tracers_out = Tracer[]
+erupted_tracers_out = Tracer[]
 last_run_out = Dict{Symbol,Any}()
 
-# Few helpers: 
-add_textbox(fig, label, value) = [Label(fig, label), Textbox(fig, stored_string = string(value), validator = typeof(value))]
-add_togglebox(fig, label, active) = [Label(fig, label), Toggle(fig, active=active)]
+# Few helpers (height=18 keeps each widget within its Fixed(18) grid row, otherwise the
+# default widget heights are taller than the row and stick out past the colored Box behind
+# it; Textbox additionally needs fontsize/textpadding reduced from their defaults, since the
+# default 8px top+bottom textpadding alone exceeds the 18px row, clipping the displayed text):
+add_textbox(fig, label, value) = [Label(fig, label), Textbox(fig, stored_string = string(value), validator = typeof(value), height=18, fontsize=11, textpadding=(4,4,2,2))]
+add_togglebox(fig, label, active) = [Label(fig, label), Toggle(fig, active=active, height=18)]
 get_valuebox(box::Vector) = parse(box[2].validator.val, box[2].stored_string.val)
 
 """
-    sill_intrusion_1D(; size=(900,900))
+    sill_intrusion_1D(; size=nothing)
 
-Interactive GLMakie App for 1D thermal intrusion model. `size` is the size of the window in pixels.
+Interactive GLMakie App for 1D thermal intrusion model. `size` is the size of the window
+in pixels; if `nothing` (default), it's chosen automatically to fit within the primary
+monitor's available height, since a fixed pixel height can be taller than some screens
+(clipping the bottom of the control panel) and there's no scrollable layout to fall back on.
 """
-function sill_intrusion_1D(; size=(1000,1000))
+function sill_intrusion_1D(; size=nothing)
     GLMakie.activate!()
     GLMakie.closeall() # close any open screen
+
+    if size === nothing
+        win_w = 1500
+        win_h = 900
+        try
+            monitor = GLMakie.GLFW.GetPrimaryMonitor()
+            vidmode = GLMakie.GLFW.GetVideoMode(monitor)
+            # GetVideoMode reports the full screen height; subtract a fixed margin for
+            # the menu bar/dock/title bar (not otherwise queryable here) rather than a
+            # percentage, since the menu bar's height doesn't scale with screen size
+            win_h = min(win_h, vidmode.height - 130)
+        catch e
+            @warn "Could not query monitor size; using default window height" exception=e
+        end
+        size = (win_w, win_h)
+    end
 
     fig = Figure(size=size)
 
@@ -35,56 +59,66 @@ function sill_intrusion_1D(; size=(1000,1000))
 
     Label(fig[0, 1:3], text = "1D Sill Injection", fontsize = 30)
 
-    fig[1:2, 1:2] = plots_fig = GridLayout()
+    fig[1, 1] = depth_fig = GridLayout()
+    ax1 =  Axis(depth_fig[1:3, 1], xlabel="Temperature [ᵒC]", ylabel="Depth [km]", title = @lift("t = $(round($time_val, digits = 2)) kyrs"))
+    ax2 =  Axis(depth_fig[1:3, 2], xlabel="Melt fraction ϕ")
 
-    ax1 =  Axis(plots_fig[1, 1], xlabel="Temperature [ᵒC]", ylabel="Depth [km]", title = @lift("t = $(round($time_val, digits = 2)) kyrs"))
-    ax2 =  Axis(plots_fig[1, 2], xlabel="Melt fraction ϕ")
-    ax3 =  Axis(plots_fig[2, 1:2], xlabel="Time [kyrs]", ylabel="Maximum Temperature [ᵒC]",ytickcolor=:red,ylabelcolor=:red,yticklabelcolor=:red)
-    ax4 =  Axis(plots_fig[2, 1:2], ylabel="Maximum melt fraction ϕ",ytickcolor=:blue,ylabelcolor=:blue,yticklabelcolor=:blue,  yaxisposition = :right)
+    fig[1, 2] = timeseries_fig = GridLayout()
+    ax3 =  Axis(timeseries_fig[1, 1], xlabel="Time [kyrs]", ylabel="Maximum Temperature [ᵒC]",ytickcolor=:red,ylabelcolor=:red,yticklabelcolor=:red)
+    ax4 =  Axis(timeseries_fig[1, 1], ylabel="Maximum melt fraction ϕ",ytickcolor=:blue,ylabelcolor=:blue,yticklabelcolor=:blue,  yaxisposition = :right)
+    ax5 =  Axis(timeseries_fig[2, 1], xlabel="Time [kyrs]", ylabel="Cumulative erupted volume [km³]",ytickcolor=:darkgreen,ylabelcolor=:darkgreen,yticklabelcolor=:darkgreen)
+    ax5b = Axis(timeseries_fig[2, 1], ylabel="Erupted volume per event [km³]",ytickcolor=:orange,ylabelcolor=:orange,yticklabelcolor=:orange,  yaxisposition = :right)
 
     linkxaxes!(ax3, ax4)
+    linkxaxes!(ax3, ax5)
+    linkxaxes!(ax3, ax5b)
 
-    fig[1:2, 3] = grid = GridLayout(tellwidth = false)
-    rowgap!(grid, 2)
+    fig[1, 3] = grid = GridLayout(tellwidth = false)
+    rowgap!(grid, 0)
 
-    grid[1, 1] = but            = Button(fig, label = "  RUN SIMULATION  ", buttoncolor = :lightgreen)
-    grid[1, 2] = but_stop       = Button(fig, label = "  STOP  ", buttoncolor = :red)
+    grid[1, 1] = but            = Button(fig, label = "  RUN SIMULATION  ", buttoncolor = :lightgreen, height=18, fontsize=11)
+    grid[1, 2] = but_stop       = Button(fig, label = "  STOP  ", buttoncolor = :red, height=18, fontsize=11)
 
-    Box(grid[2:4, 1:2], color = :lightgrey, cornerradius = 10)
-    grid[2, 1:2] = Δz_box       = add_textbox(fig,"Grid spacing Δz [m]:",20)
-    grid[3, 1:2] = nt_box       = add_textbox(fig,"# timesteps nt:",3000)
-    grid[4, 1:2] = Δt_yrs_box   = add_textbox(fig,"timestep Δt [yrs]:",100.0)
+    Box(grid[2:3, 1:4], color = :lightgrey, cornerradius = 10)
+    grid[2, 1:2] = Δz_box       = add_textbox(fig,"Δz [m]:",20)
+    grid[2, 3:4] = nt_box       = add_textbox(fig,"# steps nt:",3000)
+    grid[3, 1:2] = Δt_yrs_box   = add_textbox(fig,"Δt [yrs]:",100.0)
 
-    Box(grid[5:7, 1:2], color = :lightblue, cornerradius = 10)
-    grid[5, 1:2] = H_box        = add_textbox(fig,"Crustal thickness [km]:",40.0)
-    grid[6, 1:2] = Ttop_box     = add_textbox(fig,"Ttop [ᵒC]:",0.0)
-    grid[7, 1:2] = γ_box        = add_textbox(fig,"Geotherm [ᵒC/km]:",20.0)
+    Box(grid[4:5, 1:4], color = :lightblue, cornerradius = 10)
+    grid[4, 1:2] = H_box        = add_textbox(fig,"Crust [km]:",40.0)
+    grid[4, 3:4] = Ttop_box     = add_textbox(fig,"Ttop [ᵒC]:",0.0)
+    grid[5, 1:2] = γ_box        = add_textbox(fig,"Geotherm [ᵒC/km]:",20.0)
 
-    Box(grid[8:12, 1:2], color = :lightyellow, cornerradius = 10)
-    grid[8, 1:2] = Tsill_box    = add_textbox(fig,"Sill Temperature [ᵒC]:",1200.0)
-    grid[9, 1:2] = Sill_thick_box = add_textbox(fig,"Sill thickness [m]:",100.0)
-    grid[10, 1:2] = Sill_interval_box = add_textbox(fig,"Sill injection interval [yrs]:",1000.0)
-    grid[11, 1:2] = Sill_interval_top_box = add_textbox(fig,"Top sill injection [km]:",10.0)
-    grid[12, 1:2] = Sill_interval_bot_box = add_textbox(fig,"Bottom sill injection [km]:",20.0)
+    Box(grid[6:8, 1:4], color = :lightyellow, cornerradius = 10)
+    grid[6, 1:2] = Tsill_box    = add_textbox(fig,"Sill T [ᵒC]:",1200.0)
+    grid[6, 3:4] = Sill_thick_box = add_textbox(fig,"Sill thick [m]:",100.0)
+    grid[7, 1:2] = Sill_interval_box = add_textbox(fig,"Sill interval [yrs]:",1000.0)
+    grid[8, 1:2] = Sill_interval_top_box = add_textbox(fig,"Top inj. [km]:",10.0)
+    grid[8, 3:4] = Sill_interval_bot_box = add_textbox(fig,"Bottom inj. [km]:",20.0)
 
-    Box(grid[13:15, 1:2], color = (:red,0.3), cornerradius = 10 )
-    grid[13, 1:2] = Ql_box = add_textbox(fig,"Latent heat [kJ/kg]:",255.0)
-    grid[14, 1:2] = menu_conduct = Menu(fig, options = ["T-dependent conductivity", "Constant conductivity 3 W/m/K"], default = "Constant conductivity 3 W/m/K")
-    grid[15, 1:2] = menu_melting = Menu(fig, options = ["MeltingParam_Assimilation", "MeltingParam_Basalt", "MeltingParam_Rhyolite"], default = "MeltingParam_Basalt")
+    Box(grid[9:11, 1:4], color = (:red,0.3), cornerradius = 10 )
+    grid[9, 1:2] = Ql_box = add_textbox(fig,"Latent heat [kJ/kg]:",255.0)
+    grid[10, 1:4] = menu_conduct = Menu(fig, options = ["T-dependent conductivity", "Constant conductivity 3 W/m/K"], default = "Constant conductivity 3 W/m/K", height=18, fontsize=11)
+    grid[11, 1:4] = menu_melting = Menu(fig, options = ["MeltingParam_Assimilation", "MeltingParam_Basalt", "MeltingParam_Rhyolite"], default = "MeltingParam_Basalt", height=18, fontsize=11)
 
-    Box(grid[16:17, 1:2], color = (:orange,0.3), cornerradius = 10 )
-    grid[16, 1:2] = Label(fig, "Method:")
-    grid[17, 1:2] = menu_method = Menu(fig, options = ["Discrete sills", "Q_magma", "Both (compare)"], default = "Both (compare)")
+    Box(grid[12:13, 1:4], color = (:orange,0.3), cornerradius = 10 )
+    grid[12, 1:4] = Label(fig, "Method:")
+    grid[13, 1:4] = menu_method = Menu(fig, options = ["Discrete sills", "Q_magma", "Both (compare)"], default = "Both (compare)", height=18, fontsize=11)
 
-    Box(grid[18:21, 1:2], color = (:green,0.3), cornerradius = 10 )
-    grid[18, 1:2] = filename = [Label(fig, "filename (no extension):"), Textbox(fig, stored_string = "sim1")]
-    grid[19, 1] = but_save =  Button(fig, label = "  SAVE SCREENSHOT  ", buttoncolor = (:lightgreen, 0.5))
-    grid[19, 2] = but_save_data = Button(fig, label = "  SAVE DATA  ", buttoncolor = (:lightgreen, 0.5))
-    grid[20, 1:2] = record_toggle = add_togglebox(fig,"Record movie:",false)
-    grid[21, 1:2] = but_zircon = Button(fig, label = "  COMPUTE ZIRCON AGES  ", buttoncolor = (:lightgreen, 0.5))
+    Box(grid[14:16, 1:4], color = (:purple,0.2), cornerradius = 10 )
+    grid[14, 1:4] = Label(fig, "Eruption method:")
+    grid[15, 1:4] = menu_eruption = Menu(fig, options = ["None", "Caldera collapse", "Elastic collapse", "Hybrid collapse"], default = "None", height=18, fontsize=11)
+    grid[16, 1:2] = Eruption_thick_box = add_textbox(fig,"Threshold [m]:",500.0)
 
-    for r in 1:21
-        rowsize!(grid, r, Fixed(28))
+    Box(grid[17:20, 1:4], color = (:green,0.3), cornerradius = 10 )
+    grid[17, 1:2] = filename = [Label(fig, "filename:"), Textbox(fig, stored_string = "sim1", height=18, fontsize=11, textpadding=(4,4,2,2))]
+    grid[18, 1:2] = but_save =  Button(fig, label = "  SAVE SCREENSHOT  ", buttoncolor = (:lightgreen, 0.5), height=18, fontsize=11)
+    grid[18, 3:4] = but_save_data = Button(fig, label = "  SAVE DATA  ", buttoncolor = (:lightgreen, 0.5), height=18, fontsize=11)
+    grid[19, 1:2] = record_toggle = add_togglebox(fig,"Record movie:",false)
+    grid[20, 1:4] = but_zircon = Button(fig, label = "  COMPUTE ZIRCON AGES  ", buttoncolor = (:lightgreen, 0.5), height=18, fontsize=11)
+
+    for r in 1:20
+        rowsize!(grid, r, Fixed(18))
     end
 
     on(but_save.clicks) do n
@@ -158,7 +192,7 @@ function sill_intrusion_1D(; size=(1000,1000))
     end
 
 
-    rowsize!(plots_fig, 2, Relative(1/4))
+    rowsize!(timeseries_fig, 2, Relative(1/2))
 
     SecYear = 3600*24*365.25
     # Start the simulation
@@ -183,6 +217,9 @@ function sill_intrusion_1D(; size=(1000,1000))
         method      = menu_method.selection[]
         run_discrete = method=="Discrete sills" || method=="Both (compare)"
         run_Qmagma   = method=="Q_magma"        || method=="Both (compare)"
+
+        eruption_method = menu_eruption.selection[]
+        Eruption_thick  = get_valuebox(Eruption_thick_box)
 
 
         conductivity = T_Conductivity_Whittington()
@@ -235,6 +272,7 @@ function sill_intrusion_1D(; size=(1000,1000))
         # use unrelated displacement mechanisms and can't be mixed for the same tracers)
         track_discrete_tracers = run_discrete
         tracers = init_tracers(Silltop, Sillbot)
+        erupted_tracers = Tracer[]
 
         # add initial perturbation (if any)
         T_cen =  (Silltop + Sillbot)/2*1e3
@@ -301,6 +339,19 @@ function sill_intrusion_1D(; size=(1000,1000))
         ϕmax_vec  = Float64[]
         TQmax_vec = Float64[]
         ϕQmax_vec = Float64[]
+
+        # cumulative erupted volume [km^3], assuming each eruption event empties a cube
+        # whose edge length is the erupted thickness (Erupt_thick^3)
+        erupted_volume = 0.0
+        erupted_volume_vec = Float64[]
+        eruption_event_time_vec   = Float64[]   # time [kyrs] of each individual eruption
+        eruption_event_volume_vec = Float64[]   # volume [km^3] of that single event
+        # same bookkeeping for the Q_magma model, which erupts independently based on
+        # its own melt fraction
+        erupted_volume_Q = 0.0
+        erupted_volume_Q_vec = Float64[]
+        eruption_event_time_Q_vec   = Float64[]
+        eruption_event_volume_Q_vec = Float64[]
 
         Sill_z0 = -20e3;
         println("Injecting sill @ z=$Sill_z0")
@@ -381,6 +432,83 @@ function sill_intrusion_1D(; size=(1000,1000))
                 update_tracers_T!(tracers, T_Q, z, time_Myr, Params_Q.ϕ)
             end
 
+            if eruption_method != "None"
+                # all menu choices trigger on the same melt-fraction threshold; they
+                # differ in how the vent is closed (see erupt_melt!)
+                erupt_mode = eruption_method == "Elastic collapse" ? :elastic :
+                             eruption_method == "Hybrid collapse"  ? :hybrid  : :caldera
+                # skip eruptions whose footprint reaches the domain edges: erupt_melt!'s
+                # collapse needs real host rock on both sides to flow inward, and there's
+                # none left to draw on once the melt zone touches the surface or the
+                # domain's bottom boundary
+                margin = 5*Δz
+
+                # each model erupts independently, based on its own melt fraction
+                if run_discrete
+                    region = find_eruptible_region(Params.ϕ, z; ϕ_threshold=0.5)
+                    if region !== nothing
+                        z_lo, z_hi = region
+                        thickness = z_hi - z_lo
+                        near_boundary = (z_lo - margin <= z[1]) || (z_hi + margin >= z[end])
+                        if thickness >= Eruption_thick && !near_boundary
+                            Erupt_z0 = (z_lo + z_hi)/2
+                            sills_before = sum(rocks)*Δz
+                            T, rocks = erupt_melt!(T, rocks, z; Erupt_z0=Erupt_z0, Erupt_thick=thickness, method=erupt_mode)
+                            sills_after = sum(rocks)*Δz
+                            println("Intruded sills before eruption: $(round(sills_before, digits=1)) m, after: $(round(sills_after, digits=1)) m (erupted thickness: $(round(thickness, digits=1)) m)")
+                            Params.Told .= T
+                            # ϕ was computed from the pre-eruption T during this step's
+                            # nonlinear solve and isn't otherwise refreshed until next
+                            # timestep - recompute it now so the melt-fraction plot and the
+                            # eruptibility check both see the post-eruption state immediately
+                            compute_meltfraction!(Params.ϕ, MatParam, Params.Phases, (T = Params.Told .+ 273.15,))
+                            if track_discrete_tracers
+                                erupted = extract_erupted_tracers!(tracers, Erupt_z0, thickness)
+                                append!(erupted_tracers, erupted)
+                                # remaining tracers ride the host rock through the closure
+                                collapse_tracers!(tracers, Erupt_z0, thickness; method=erupt_mode)
+                            end
+                            event_volume = thickness^3 / 1e9   # m^3 -> km^3
+                            erupted_volume += event_volume
+                            push!(eruption_event_time_vec, time_kyrs)
+                            push!(eruption_event_volume_vec, event_volume)
+                            println("Eruption (discrete) @ z=$Erupt_z0, thickness=$(round(thickness, digits=1)) m, cumulative volume=$(round(erupted_volume, digits=4)) km^3")
+                        end
+                    end
+                end
+
+                if run_Qmagma
+                    region = find_eruptible_region(Params_Q.ϕ, z; ϕ_threshold=0.5)
+                    if region !== nothing
+                        z_lo, z_hi = region
+                        thickness = z_hi - z_lo
+                        near_boundary = (z_lo - margin <= z[1]) || (z_hi + margin >= z[end])
+                        if thickness >= Eruption_thick && !near_boundary
+                            Erupt_z0 = (z_lo + z_hi)/2
+                            T_Q, _ = erupt_melt!(T_Q, zero(T_Q), z; Erupt_z0=Erupt_z0, Erupt_thick=thickness, method=erupt_mode)
+                            Params_Q.Told .= T_Q
+                            compute_meltfraction!(Params_Q.ϕ, MatParam, Params_Q.Phases, (T = Params_Q.Told .+ 273.15,))
+                            # the injection-zone boundary markers (dashed lines in ax2)
+                            # ride on the host rock through the closure
+                            collapse_markers!(zone_markers, Erupt_z0, thickness; method=erupt_mode)
+                            if !track_discrete_tracers
+                                erupted = extract_erupted_tracers!(tracers, Erupt_z0, thickness)
+                                append!(erupted_tracers, erupted)
+                                # remaining tracers ride the host rock through the closure
+                                collapse_tracers!(tracers, Erupt_z0, thickness; method=erupt_mode)
+                            end
+                            event_volume = thickness^3 / 1e9   # m^3 -> km^3
+                            erupted_volume_Q += event_volume
+                            push!(eruption_event_time_Q_vec, time_kyrs)
+                            push!(eruption_event_volume_Q_vec, event_volume)
+                            println("Eruption (Q_magma) @ z=$Erupt_z0, thickness=$(round(thickness, digits=1)) m, cumulative volume=$(round(erupted_volume_Q, digits=4)) km^3")
+                        end
+                    end
+                end
+            end
+            push!(erupted_volume_vec, erupted_volume)
+            push!(erupted_volume_Q_vec, erupted_volume_Q)
+
             push!(time_vec, time_kyrs)
             if run_discrete
                 push!(Tmax_vec, maximum(T))
@@ -436,6 +564,28 @@ function sill_intrusion_1D(; size=(1000,1000))
                 end
                 ylims!(ax4, 0, 1.01)
 
+                empty!(ax5)
+                if run_discrete
+                    lines!(ax5, time_vec, erupted_volume_vec, color=:darkgreen)
+                end
+                if run_Qmagma
+                    lines!(ax5, time_vec, erupted_volume_Q_vec, color=:darkgreen, linestyle=:dash)
+                end
+                vol_max = max(run_discrete ? maximum(erupted_volume_vec)   : 0.0,
+                              run_Qmagma   ? maximum(erupted_volume_Q_vec) : 0.0, 1e-9)
+                ylims!(ax5, 0, vol_max*1.1)
+
+                empty!(ax5b)
+                if !isempty(eruption_event_time_vec)
+                    stem!(ax5b, eruption_event_time_vec, eruption_event_volume_vec, color=:orange)
+                end
+                if !isempty(eruption_event_time_Q_vec)
+                    stem!(ax5b, eruption_event_time_Q_vec, eruption_event_volume_Q_vec, color=:purple)
+                end
+                event_max = max(isempty(eruption_event_volume_vec)   ? 0.0 : maximum(eruption_event_volume_vec),
+                                isempty(eruption_event_volume_Q_vec) ? 0.0 : maximum(eruption_event_volume_Q_vec), 1e-9)
+                ylims!(ax5b, 0, event_max*1.1)
+
                 println("Timestep $t, $time_kyrs kyrs, nz=$(length(T)) pts; crust added: $crust_added km")
 
                 if recording
@@ -464,12 +614,16 @@ function sill_intrusion_1D(; size=(1000,1000))
             last_run[:phi_Qmagma] = Params_Q.ϕ
             last_run[:Tmax_vec_Qmagma] = TQmax_vec
             last_run[:phimax_vec_Qmagma] = ϕQmax_vec
+            last_run[:erupted_volume_vec_Qmagma] = erupted_volume_Q_vec
         end
         last_run[:tracers] = tracers
+        last_run[:erupted_tracers] = erupted_tracers
+        last_run[:erupted_volume_vec] = erupted_volume_vec
 
         global tracers_out = tracers
+        global erupted_tracers_out = erupted_tracers
         global last_run_out = copy(last_run)
-        println("Simulation data available in the REPL: `QMagma.tracers_out` (tracer T-t histories), `QMagma.last_run_out` (1D profiles z/T/phi vs depth, and Tmax/phimax vs time)")
+        println("Simulation data available in the REPL: `QMagma.tracers_out` (tracer T-t histories), `QMagma.erupted_tracers_out` (tracers removed by eruption), `QMagma.last_run_out` (1D profiles z/T/phi vs depth, Tmax/phimax vs time, and erupted_volume_vec)")
         println("Compute zircon ages with: `QMagma.compute_zircon_ages(QMagma.tracers_out)`, or click COMPUTE ZIRCON AGES")
         catch err
             @error "Simulation loop failed" exception=(err, catch_backtrace())

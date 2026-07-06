@@ -20,6 +20,6 @@ Press `RUN SIMULATION` in the window to start the thermal model. Model parameter
 - [x] Add tracers (potentially reuse MTK.jl tracers here) to track temperature over time
 - [x] Add ZirconGrowth.jl extension 
 - [x] Compute zircon ages from tracers and plot age density & cumulative probability spectra
-- [ ] Add eruption algotithm
+- [ ] Add eruption algorithm
 - [ ] Add plot of eruption volume vs time & GUI input for eruption triggers
 - [ ] Add plot of zircon ages of erupted material on plot

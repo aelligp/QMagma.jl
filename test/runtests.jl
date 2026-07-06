@@ -386,6 +386,138 @@ const SecYear = 3600 * 24 * 365.25
         @test all(T2[ind] .≈ Sill_T)
         @test all(rocks2[ind] .== 1)
         @test sum(rocks2) > 0
+        # rocks is advected with the same displacement as T and re-binarized by rounding;
+        # here the constant 400 m displacement is grid-aligned (4 cells), so the total
+        # grows by exactly the inserted band's cell count
+        @test sum(rocks2) == sum(rocks) + length(ind)
+        @test all((rocks2 .== 0) .| (rocks2 .== 1))
+    end
+
+    @testset "find_eruptible_region" begin
+        z = collect(-10e3:100.0:0.0)
+        ϕ = zeros(length(z))
+
+        @test QMagma.find_eruptible_region(ϕ, z) === nothing
+
+        ind = findall(-6e3 .<= z .<= -4e3)
+        ϕ[ind] .= 0.8
+        region = QMagma.find_eruptible_region(ϕ, z; ϕ_threshold=0.5)
+        @test region !== nothing
+        zlo, zhi = region
+        @test zlo ≈ minimum(z[ind])
+        @test zhi ≈ maximum(z[ind])
+
+        # two disjoint melt lenses: only the larger contiguous run should be reported,
+        # not the envelope spanning both (which would wildly overstate the thickness)
+        ϕ2 = zeros(length(z))
+        ind_small = findall(-9e3 .<= z .<= -8.9e3)   # ~100 m lens near the bottom
+        ind_big   = findall(-3e3 .<= z .<= -1e3)     # ~2 km lens near the top
+        ϕ2[ind_small] .= 0.8
+        ϕ2[ind_big]   .= 0.8
+        region2 = QMagma.find_eruptible_region(ϕ2, z; ϕ_threshold=0.5)
+        @test region2 !== nothing
+        zlo2, zhi2 = region2
+        @test zlo2 ≈ minimum(z[ind_big])
+        @test zhi2 ≈ maximum(z[ind_big])
+    end
+
+    @testset "erupt_melt!" begin
+        z = collect(-10e3:100.0:0.0)
+        T = fill(800.0, length(z))
+        rocks = zeros(length(z))
+
+        Erupt_z0 = -5e3
+        Erupt_thick = 1000.0
+        ind = findall(abs.(z .- Erupt_z0) .<= Erupt_thick / 2)
+        T[ind] .= 1200.0
+        rocks[ind] .= 1.0
+
+        T2, rocks2 = QMagma.erupt_melt!(T, rocks, z; Erupt_z0=Erupt_z0, Erupt_thick=Erupt_thick)
+
+        @test length(T2) == length(z)
+        # caldera subsidence: the erupted band's heat leaves exactly, replaced at the
+        # top by the surface-temperature fill; no rock parcel changes temperature
+        @test sum(T2) ≈ sum(T) - sum(T[ind]) + length(ind)*T[end]
+        # the roof block (uniformly 800.0) dropped onto the chamber floor
+        @test all(T2[ind] .≈ 800.0)
+        @test all(rocks2[ind] .== 0)
+
+        # erupting from the middle of a wider intruded pile: the roof grey drops onto
+        # the floor grey, so the total drops by exactly the erupted band's content and
+        # no host-rock gap is left inside the remaining grey
+        rocks_wide = zeros(length(z))
+        ind_wide = findall(abs.(z .- Erupt_z0) .<= 2000.0)
+        rocks_wide[ind_wide] .= 1.0
+        _, rocks3 = QMagma.erupt_melt!(T, rocks_wide, z; Erupt_z0=Erupt_z0, Erupt_thick=Erupt_thick)
+        @test length(rocks3) == length(z)
+        @test sum(rocks3) == sum(rocks_wide) - length(ind)
+        @test all((rocks3 .== 0) .| (rocks3 .== 1))
+        grey_idx = findall(rocks3 .> 0)
+        @test all(diff(grey_idx) .== 1)
+
+        # the whole grey envelope above the vent subsides with the roof: its top edge
+        # drops by the band's actual grid footprint (length(ind) cells)
+        Δz_grid = z[2] - z[1]
+        @test maximum(z[rocks3 .> 0]) ≈ maximum(z[rocks_wide .> 0]) - length(ind)*Δz_grid
+
+        # elastic collapse variant: the walls close over the vent at their own
+        # temperature (uniform 800 surroundings -> 800 in the band), grey bounded by
+        # the band's content
+        T4, rocks5 = QMagma.erupt_melt!(T, rocks_wide, z; Erupt_z0=Erupt_z0, Erupt_thick=Erupt_thick, method=:elastic)
+        @test all(T4[ind] .≈ 800.0)
+        @test sum(rocks_wide) - length(ind) <= sum(rocks5) <= sum(rocks_wide)
+        @test all((rocks5 .== 0) .| (rocks5 .== 1))
+
+        # hybrid variant: floor rises elastically, roof transitions to a rigid
+        # subsidence - the surface sinks by ~the erupted thickness and the warped
+        # grid stays monotonic
+        D = QMagma.collapse_displacement(z; Erupt_z0=Erupt_z0, Erupt_thick=Erupt_thick, method=:hybrid)
+        @test all(diff(z .+ D) .> 0)
+        @test isapprox(D[end], -Erupt_thick; rtol=0.1)
+        @test D[1] == 0.0
+        T5, rocks6 = QMagma.erupt_melt!(T, rocks_wide, z; Erupt_z0=Erupt_z0, Erupt_thick=Erupt_thick, method=:hybrid)
+        @test all(T5[ind] .≈ 800.0)                    # walls meet at their own T
+        @test minimum(T5) >= minimum(T) - 1e-8         # intensive transport: no dilution values
+        @test all((rocks6 .== 0) .| (rocks6 .== 1))
+    end
+
+    @testset "collapse_markers!/collapse_tracers!" begin
+        Erupt_z0, Erupt_thick = -5e3, 1000.0
+
+        # caldera: above drops by the full thickness, inside lands on the floor, below stays
+        m = [-2e3, -5e3, -8e3]
+        QMagma.collapse_markers!(m, Erupt_z0, Erupt_thick)
+        @test m ≈ [-3e3, -5.5e3, -8e3]
+
+        # elastic: inside snaps to the vent center, outside moves toward it by less
+        # than the half-thickness
+        m2 = [-2e3, -5e3, -8e3]
+        QMagma.collapse_markers!(m2, Erupt_z0, Erupt_thick; method=:elastic)
+        @test m2[2] == Erupt_z0
+        @test -2.5e3 < m2[1] < -2e3
+        @test -8e3 < m2[3] < -7.5e3
+
+        # tracers follow the same displacement
+        tracers = [QMagma.Tracer(-2e3, 600.0, 0.0, 0, Float64[], Float64[]),
+                   QMagma.Tracer(-8e3, 600.0, 0.0, 0, Float64[], Float64[])]
+        QMagma.collapse_tracers!(tracers, Erupt_z0, Erupt_thick)
+        @test tracers[1].z ≈ -3e3
+        @test tracers[2].z ≈ -8e3
+    end
+
+    @testset "extract_erupted_tracers!" begin
+        Erupt_z0, Erupt_thick = -5e3, 1000.0
+        tracers = [
+            QMagma.Tracer(-5e3, 1200.0, 1.0, 1, Float64[], Float64[]),    # inside erupted band
+            QMagma.Tracer(-5.4e3, 1100.0, 0.7, 1, Float64[], Float64[]), # inside erupted band
+            QMagma.Tracer(-2e3, 600.0, 0.0, 0, Float64[], Float64[]),    # outside
+        ]
+
+        erupted = QMagma.extract_erupted_tracers!(tracers, Erupt_z0, Erupt_thick)
+
+        @test length(erupted) == 2
+        @test length(tracers) == 1
+        @test tracers[1].z ≈ -2e3
     end
 
 end
