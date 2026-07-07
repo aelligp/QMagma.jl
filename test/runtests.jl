@@ -481,6 +481,17 @@ const SecYear = 3600 * 24 * 365.25
         @test all((rocks6 .== 0) .| (rocks6 .== 1))
     end
 
+    @testset "melt_thickness" begin
+        z = collect(-10e3:100.0:0.0)
+        ϕ = zeros(length(z))
+        ind = findall(-6e3 .<= z .<= -4e3)
+        ϕ[ind] .= 0.8
+        # ∫ϕ dz over the band: 0.8 * (number of band cells) * Δz
+        @test QMagma.melt_thickness(ϕ, z, -6e3, -4e3) ≈ 0.8*length(ind)*100.0
+        # empty interval
+        @test QMagma.melt_thickness(ϕ, z, -2e3, -1e3) == 0.0
+    end
+
     @testset "collapse_markers!/collapse_tracers!" begin
         Erupt_z0, Erupt_thick = -5e3, 1000.0
 

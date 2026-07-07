@@ -581,6 +581,22 @@ function collapse_conservative(T, z; Erupt_z0, Erupt_thick, R=Erupt_thick/2)
 end
 
 """
+    melt_thickness(ϕ, z, z_lo, z_hi)
+
+Melt content `∫ϕ dz` [m] of the depth interval `[z_lo, z_hi]` - the dense-rock
+equivalent thickness of the melt held in that band. This is what actually leaves the
+column when the band erupts: the crystal framework stays, so the vent closure
+amplitude and the erupted volume (`A_sill * melt_thickness`) are based on the melt
+content rather than on the bulk band thickness.
+"""
+function melt_thickness(ϕ, z, z_lo, z_hi)
+    zv = Vector(z)
+    Δz = zv[2] - zv[1]
+    ind = findall(z_lo .<= zv .<= z_hi)
+    return sum(ϕ[ind]) * Δz
+end
+
+"""
     erupt_displacement(zm, Erupt_z0, Erupt_thick; method=:caldera, R=Erupt_thick/2)
 
 New position of a material point at depth `zm` under the eruption closure of

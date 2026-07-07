@@ -57,14 +57,34 @@ mechanics, and a GLMakie GUI. Two side-by-side model flavors:
 
 ## Eruption mechanics (hard-won semantics — read before touching)
 
-Trigger (GUI loop): largest contiguous run of `ϕ > 0.5` (`find_eruptible_region`);
-erupts when its thickness ≥ threshold and it is ≥ `5Δz` from the domain edges. The whole
-ϕ>0.5 band erupts. Each model (discrete / Q_magma) erupts independently based on its own
-ϕ. Erupted tracers are extracted (`extract_erupted_tracers!`) for zircon statistics;
+The 1D column represents the axis of a laterally finite sill/chamber of area
+`A_sill = π R_sill²` (GUI input, default radius 5 km — matching `insert_sill`'s elastic
+decay radius). Only the melt content of the eruptible band leaves the column
+(`melt_thickness` = ∫ϕ dz; the crystal framework stays), so the closure amplitude is
+`h_melt` (or the elastic-storage release, below) and the erupted volume is
+`A_sill * h_erupt` — not the old `thickness³` cube.
+
+Two trigger types (GUI menu), each model (discrete / Q_magma) evaluated independently
+on its own ϕ:
+
+- **Melt-fraction threshold** (Caldera/Elastic/Hybrid menu items): largest contiguous
+  run of `ϕ > 0.5` (`find_eruptible_region`) erupts its melt content when its bulk
+  thickness ≥ threshold and it is ≥ `5Δz` from the domain edges.
+- **Elastic box model** ("Elastic box model" menu item): the chamber is an elastic
+  reservoir with storage `β_eff = β_magma + 3/(4μ)`. Recharge into an existing mush
+  raises overpressure (`P_over += ΔV_in/(V_ch β_eff)` with `V_ch = A_sill·h_band`;
+  discrete sills on injection, Q_magma continuously); eruption triggers at
+  `P_over ≥ ΔP_c`, erupts `h_erupt = min(β_eff·h_band·P_over, h_melt)` with the hybrid
+  closure, and resets `P_over` to lithostatic. With default parameters, elastic storage
+  (~0.35% of chamber volume) is far smaller than one sill, so eruptions are
+  injection-paced with volume ≈ recharge volume — the known elastically-limited regime,
+  not a bug.
+
+Erupted tracers are extracted (`extract_erupted_tracers!`) for zircon statistics;
 remaining tracers and the Q_magma zone markers are moved with the same mechanism as the
 fields (`collapse_tracers!`, `collapse_markers!`, both via `erupt_displacement`).
 
-Three closure mechanisms in `erupt_melt!(...; method=...)`, selectable in the GUI menu:
+Three closure mechanisms in `erupt_melt!(...; method=...)`:
 
 | method | host rock motion | removes heat/grey | T preserved pointwise |
 |---|---|---|---|

@@ -105,19 +105,23 @@ function sill_intrusion_1D(; size=nothing)
     grid[12, 1:4] = Label(fig, "Method:")
     grid[13, 1:4] = menu_method = Menu(fig, options = ["Discrete sills", "Q_magma", "Both (compare)"], default = "Both (compare)", height=18, fontsize=11)
 
-    Box(grid[14:16, 1:4], color = (:purple,0.2), cornerradius = 10 )
+    Box(grid[14:18, 1:4], color = (:purple,0.2), cornerradius = 10 )
     grid[14, 1:4] = Label(fig, "Eruption method:")
-    grid[15, 1:4] = menu_eruption = Menu(fig, options = ["None", "Caldera collapse", "Elastic collapse", "Hybrid collapse"], default = "None", height=18, fontsize=11)
+    grid[15, 1:4] = menu_eruption = Menu(fig, options = ["None", "Caldera collapse", "Elastic collapse", "Hybrid collapse", "Elastic box model"], default = "None", height=18, fontsize=11)
     grid[16, 1:2] = Eruption_thick_box = add_textbox(fig,"Threshold [m]:",500.0)
+    grid[16, 3:4] = Sill_radius_box    = add_textbox(fig,"Sill radius [km]:",5.0)
+    grid[17, 1:2] = dPc_box            = add_textbox(fig,"ΔP crit [MPa]:",20.0)
+    grid[17, 3:4] = mu_box             = add_textbox(fig,"μ shear [GPa]:",10.0)
+    grid[18, 1:2] = beta_box           = add_textbox(fig,"β magma [1/GPa]:",0.1)
 
-    Box(grid[17:20, 1:4], color = (:green,0.3), cornerradius = 10 )
-    grid[17, 1:2] = filename = [Label(fig, "filename:"), Textbox(fig, stored_string = "sim1", height=18, fontsize=11, textpadding=(4,4,2,2))]
-    grid[18, 1:2] = but_save =  Button(fig, label = "  SAVE SCREENSHOT  ", buttoncolor = (:lightgreen, 0.5), height=18, fontsize=11)
-    grid[18, 3:4] = but_save_data = Button(fig, label = "  SAVE DATA  ", buttoncolor = (:lightgreen, 0.5), height=18, fontsize=11)
-    grid[19, 1:2] = record_toggle = add_togglebox(fig,"Record movie:",false)
-    grid[20, 1:4] = but_zircon = Button(fig, label = "  COMPUTE ZIRCON AGES  ", buttoncolor = (:lightgreen, 0.5), height=18, fontsize=11)
+    Box(grid[19:22, 1:4], color = (:green,0.3), cornerradius = 10 )
+    grid[19, 1:2] = filename = [Label(fig, "filename:"), Textbox(fig, stored_string = "sim1", height=18, fontsize=11, textpadding=(4,4,2,2))]
+    grid[20, 1:2] = but_save =  Button(fig, label = "  SAVE SCREENSHOT  ", buttoncolor = (:lightgreen, 0.5), height=18, fontsize=11)
+    grid[20, 3:4] = but_save_data = Button(fig, label = "  SAVE DATA  ", buttoncolor = (:lightgreen, 0.5), height=18, fontsize=11)
+    grid[21, 1:2] = record_toggle = add_togglebox(fig,"Record movie:",false)
+    grid[22, 1:4] = but_zircon = Button(fig, label = "  COMPUTE ZIRCON AGES  ", buttoncolor = (:lightgreen, 0.5), height=18, fontsize=11)
 
-    for r in 1:20
+    for r in 1:22
         rowsize!(grid, r, Fixed(18))
     end
 
@@ -220,6 +224,15 @@ function sill_intrusion_1D(; size=nothing)
 
         eruption_method = menu_eruption.selection[]
         Eruption_thick  = get_valuebox(Eruption_thick_box)
+        # lateral extent of the sill/chamber the 1D column represents: erupted volumes
+        # are A_sill * melt thickness, and the elastic box model stores recharge in the
+        # chamber's elastic compliance
+        R_sill  = get_valuebox(Sill_radius_box)*1e3          # [m]
+        A_sill  = pi*R_sill^2                                # [m^2]
+        ΔPc     = get_valuebox(dPc_box)*1e6                  # critical overpressure [Pa]
+        μ_shear = get_valuebox(mu_box)*1e9                   # host-rock shear modulus [Pa]
+        β_magma = get_valuebox(beta_box)/1e9                 # magma compressibility [1/Pa]
+        β_eff   = β_magma + 3/(4*μ_shear)                    # spherical-chamber storage [1/Pa]
 
 
         conductivity = T_Conductivity_Whittington()
@@ -353,6 +366,12 @@ function sill_intrusion_1D(; size=nothing)
         eruption_event_time_Q_vec   = Float64[]
         eruption_event_volume_Q_vec = Float64[]
 
+        # chamber overpressure [Pa] for the elastic box model, one per model: recharge
+        # into an existing mush inflates the chamber against the elastic walls
+        # (storage β_eff); eruption relaxes it back to lithostatic
+        P_over   = 0.0
+        P_over_Q = 0.0
+
         Sill_z0 = -20e3;
         println("Injecting sill @ z=$Sill_z0")
 
@@ -397,6 +416,16 @@ function sill_intrusion_1D(; size=nothing)
                         add_sill_tracers!(tracers, Sill_z0, Sillthick, Tsill)
                     end
 
+                    if eruption_method == "Elastic box model"
+                        # a sill injected into an existing mush pressurizes the chamber
+                        # against the elastic walls; with no mush the dike just freezes
+                        region_p = find_eruptible_region(Params.ϕ, z; ϕ_threshold=0.5)
+                        if region_p !== nothing
+                            h_band = region_p[2] - region_p[1]
+                            P_over += Sillthick/(max(h_band, Sillthick)*β_eff)
+                        end
+                    end
+
                     crust_added += Sillthick/1e3
                     crust_added_numerics = sum(rocks)*Δz/1e3
                     println("Injecting sill @ z=$Sill_z0")
@@ -433,10 +462,11 @@ function sill_intrusion_1D(; size=nothing)
             end
 
             if eruption_method != "None"
-                # all menu choices trigger on the same melt-fraction threshold; they
-                # differ in how the vent is closed (see erupt_melt!)
+                # closure kinematics: the box model uses the hybrid closure (the axial
+                # trace of half-space chamber deflation); the other modes as named
+                box_mode   = eruption_method == "Elastic box model"
                 erupt_mode = eruption_method == "Elastic collapse" ? :elastic :
-                             eruption_method == "Hybrid collapse"  ? :hybrid  : :caldera
+                             eruption_method == "Caldera collapse" ? :caldera : :hybrid
                 # skip eruptions whose footprint reaches the domain edges: erupt_melt!'s
                 # collapse needs real host rock on both sides to flow inward, and there's
                 # none left to draw on once the melt zone touches the surface or the
@@ -450,12 +480,18 @@ function sill_intrusion_1D(; size=nothing)
                         z_lo, z_hi = region
                         thickness = z_hi - z_lo
                         near_boundary = (z_lo - margin <= z[1]) || (z_hi + margin >= z[end])
-                        if thickness >= Eruption_thick && !near_boundary
+                        # only the band's melt content can leave the column (the crystal
+                        # framework stays): threshold modes erupt it all at once; the box
+                        # model erupts the volume held in the chamber's elastic storage
+                        h_melt  = melt_thickness(Params.ϕ, z, z_lo, z_hi)
+                        h_erupt = box_mode ? min(β_eff*thickness*P_over, h_melt) : h_melt
+                        trigger = box_mode ? (P_over >= ΔPc) : (thickness >= Eruption_thick)
+                        if trigger && !near_boundary && h_erupt > 2*Δz
                             Erupt_z0 = (z_lo + z_hi)/2
                             sills_before = sum(rocks)*Δz
-                            T, rocks = erupt_melt!(T, rocks, z; Erupt_z0=Erupt_z0, Erupt_thick=thickness, method=erupt_mode)
+                            T, rocks = erupt_melt!(T, rocks, z; Erupt_z0=Erupt_z0, Erupt_thick=h_erupt, method=erupt_mode)
                             sills_after = sum(rocks)*Δz
-                            println("Intruded sills before eruption: $(round(sills_before, digits=1)) m, after: $(round(sills_after, digits=1)) m (erupted thickness: $(round(thickness, digits=1)) m)")
+                            println("Intruded sills before eruption: $(round(sills_before, digits=1)) m, after: $(round(sills_after, digits=1)) m (erupted thickness: $(round(h_erupt, digits=1)) m)")
                             Params.Told .= T
                             # ϕ was computed from the pre-eruption T during this step's
                             # nonlinear solve and isn't otherwise refreshed until next
@@ -463,16 +499,17 @@ function sill_intrusion_1D(; size=nothing)
                             # eruptibility check both see the post-eruption state immediately
                             compute_meltfraction!(Params.ϕ, MatParam, Params.Phases, (T = Params.Told .+ 273.15,))
                             if track_discrete_tracers
-                                erupted = extract_erupted_tracers!(tracers, Erupt_z0, thickness)
+                                erupted = extract_erupted_tracers!(tracers, Erupt_z0, h_erupt)
                                 append!(erupted_tracers, erupted)
                                 # remaining tracers ride the host rock through the closure
-                                collapse_tracers!(tracers, Erupt_z0, thickness; method=erupt_mode)
+                                collapse_tracers!(tracers, Erupt_z0, h_erupt; method=erupt_mode)
                             end
-                            event_volume = thickness^3 / 1e9   # m^3 -> km^3
+                            event_volume = A_sill*h_erupt / 1e9   # m^3 -> km^3
                             erupted_volume += event_volume
                             push!(eruption_event_time_vec, time_kyrs)
                             push!(eruption_event_volume_vec, event_volume)
-                            println("Eruption (discrete) @ z=$Erupt_z0, thickness=$(round(thickness, digits=1)) m, cumulative volume=$(round(erupted_volume, digits=4)) km^3")
+                            box_mode && (P_over = 0.0)   # chamber relaxed to lithostatic
+                            println("Eruption (discrete) @ z=$Erupt_z0, erupted thickness=$(round(h_erupt, digits=1)) m, volume=$(round(event_volume, digits=4)) km^3, cumulative=$(round(erupted_volume, digits=4)) km^3")
                         end
                     end
                 end
@@ -482,26 +519,34 @@ function sill_intrusion_1D(; size=nothing)
                     if region !== nothing
                         z_lo, z_hi = region
                         thickness = z_hi - z_lo
+                        # the steady Q_magma recharge pressurizes the chamber continuously
+                        if box_mode
+                            P_over_Q += (ȧ*Params_Q.Δt)/(max(thickness, Sillthick)*β_eff)
+                        end
                         near_boundary = (z_lo - margin <= z[1]) || (z_hi + margin >= z[end])
-                        if thickness >= Eruption_thick && !near_boundary
+                        h_melt  = melt_thickness(Params_Q.ϕ, z, z_lo, z_hi)
+                        h_erupt = box_mode ? min(β_eff*thickness*P_over_Q, h_melt) : h_melt
+                        trigger = box_mode ? (P_over_Q >= ΔPc) : (thickness >= Eruption_thick)
+                        if trigger && !near_boundary && h_erupt > 2*Δz
                             Erupt_z0 = (z_lo + z_hi)/2
-                            T_Q, _ = erupt_melt!(T_Q, zero(T_Q), z; Erupt_z0=Erupt_z0, Erupt_thick=thickness, method=erupt_mode)
+                            T_Q, _ = erupt_melt!(T_Q, zero(T_Q), z; Erupt_z0=Erupt_z0, Erupt_thick=h_erupt, method=erupt_mode)
                             Params_Q.Told .= T_Q
                             compute_meltfraction!(Params_Q.ϕ, MatParam, Params_Q.Phases, (T = Params_Q.Told .+ 273.15,))
                             # the injection-zone boundary markers (dashed lines in ax2)
                             # ride on the host rock through the closure
-                            collapse_markers!(zone_markers, Erupt_z0, thickness; method=erupt_mode)
+                            collapse_markers!(zone_markers, Erupt_z0, h_erupt; method=erupt_mode)
                             if !track_discrete_tracers
-                                erupted = extract_erupted_tracers!(tracers, Erupt_z0, thickness)
+                                erupted = extract_erupted_tracers!(tracers, Erupt_z0, h_erupt)
                                 append!(erupted_tracers, erupted)
                                 # remaining tracers ride the host rock through the closure
-                                collapse_tracers!(tracers, Erupt_z0, thickness; method=erupt_mode)
+                                collapse_tracers!(tracers, Erupt_z0, h_erupt; method=erupt_mode)
                             end
-                            event_volume = thickness^3 / 1e9   # m^3 -> km^3
+                            event_volume = A_sill*h_erupt / 1e9   # m^3 -> km^3
                             erupted_volume_Q += event_volume
                             push!(eruption_event_time_Q_vec, time_kyrs)
                             push!(eruption_event_volume_Q_vec, event_volume)
-                            println("Eruption (Q_magma) @ z=$Erupt_z0, thickness=$(round(thickness, digits=1)) m, cumulative volume=$(round(erupted_volume_Q, digits=4)) km^3")
+                            box_mode && (P_over_Q = 0.0)   # chamber relaxed to lithostatic
+                            println("Eruption (Q_magma) @ z=$Erupt_z0, erupted thickness=$(round(h_erupt, digits=1)) m, volume=$(round(event_volume, digits=4)) km^3, cumulative=$(round(erupted_volume_Q, digits=4)) km^3")
                         end
                     end
                 end
