@@ -386,11 +386,30 @@ const SecYear = 3600 * 24 * 365.25
         @test all(T2[ind] .≈ Sill_T)
         @test all(rocks2[ind] .== 1)
         @test sum(rocks2) > 0
-        # rocks is advected with the same displacement as T and re-binarized by rounding;
-        # here the constant 400 m displacement is grid-aligned (4 cells), so the total
-        # grows by exactly the inserted band's cell count
+        # a single injection into empty host advects an all-zero field (stays zero), then
+        # sets the band to 1, so here the grey grows by exactly the inserted band's cells
         @test sum(rocks2) == sum(rocks) + length(ind)
         @test all((rocks2 .== 0) .| (rocks2 .== 1))
+    end
+
+    @testset "insert_sill conserves injected crust (grey rocks)" begin
+        # regression: the phase indicator must not leak under repeated advection. The old
+        # semi-Lagrangian + round scheme lost ~25% of the grey over 40 injections; the
+        # conservative remap keeps Σ rocks·Δz ≈ total injected thickness.
+        z  = collect(-40e3:100.0:0.0)
+        Δz = 100.0
+        T  = fill(400.0, length(z))
+        rocks = zero(z)
+        injected = 0.0
+        depths = collect(-30e3:1.0:-5e3)
+        for k in 1:40
+            z0 = depths[(k*911) % length(depths) + 1]   # deterministic spread of depths
+            T, rocks = QMagma.insert_sill(T, rocks, z; Sill_thick=400.0, Sill_z0=z0, Sill_T=1200.0)
+            injected += 400.0
+        end
+        grey = sum(rocks)*Δz
+        @test grey/injected > 0.9        # was ~0.74 with the lossy round scheme
+        @test grey <= injected*1.05      # and does not spuriously inflate
     end
 
     @testset "find_eruptible_region" begin
@@ -466,7 +485,10 @@ const SecYear = 3600 * 24 * 365.25
         T4, rocks5 = QMagma.erupt_melt!(T, rocks_wide, z; Erupt_z0=Erupt_z0, Erupt_thick=Erupt_thick, method=:elastic)
         @test all(T4[ind] .≈ 800.0)
         @test sum(rocks_wide) - length(ind) <= sum(rocks5) <= sum(rocks_wide)
-        @test all((rocks5 .== 0) .| (rocks5 .== 1))
+        # grey is now the conservative fractional remap (co-moves with T, no round): the
+        # surviving grey stays non-negative and does not inflate away from a phase indicator
+        @test all(rocks5 .>= -1e-9)
+        @test maximum(rocks5) <= 2.0
 
         # hybrid variant: floor rises elastically, roof transitions to a rigid
         # subsidence - the surface sinks by ~the erupted thickness and the warped
@@ -478,7 +500,8 @@ const SecYear = 3600 * 24 * 365.25
         T5, rocks6 = QMagma.erupt_melt!(T, rocks_wide, z; Erupt_z0=Erupt_z0, Erupt_thick=Erupt_thick, method=:hybrid)
         @test all(T5[ind] .≈ 800.0)                    # walls meet at their own T
         @test minimum(T5) >= minimum(T) - 1e-8         # intensive transport: no dilution values
-        @test all((rocks6 .== 0) .| (rocks6 .== 1))
+        @test all(rocks6 .>= -1e-9)
+        @test sum(rocks6) <= sum(rocks_wide)           # grey conserved minus the erupted band
     end
 
     @testset "melt_thickness" begin
@@ -529,6 +552,134 @@ const SecYear = 3600 * 24 * 365.25
         @test length(erupted) == 2
         @test length(tracers) == 1
         @test tracers[1].z ≈ -2e3
+    end
+
+    @testset "overpressure trigger (D&H 3-phase)" begin
+        @test QMagma._overpressure_selfcheck()
+
+        ep = QMagma.EruptionParams(ΔP_crit=20e6, z_erupt_max=15e3)
+        # higher P dissolves more water -> less gas -> denser
+        ρlo, glo = QMagma.mixture_density(5e6, 1200.0, 0.7, ep)
+        ρhi, ghi = QMagma.mixture_density(3e8, 1200.0, 0.7, ep)
+        @test ρhi > ρlo && ghi < glo
+
+        z = collect(-30e3:100.0:0.0)
+        ϕ = [(-15e3 <= zi <= -12e3) ? 0.8 : 0.1 for zi in z]
+        ind, V_e, zc = QMagma.eruptible_mush(ϕ, z; ϕ_erupt=ep.ϕ_erupt)
+        @test !isempty(ind) && V_e > 0 && zc < 0
+
+        st = QMagma.EruptionState(); QMagma.init_eruption!(st, ep, zc)
+        @test st.P ≈ st.P_lith
+        @test !QMagma.overpressure_erupts(st, ep, zc)   # at lithostatic: no eruption
+        st.P = st.P_lith + ep.ΔP_crit + 1e6
+        @test QMagma.overpressure_erupts(st, ep, zc)    # over threshold: erupts
+
+        # second boiling (D&H's dominant trigger): crystallizing (ϕ_melt↓) must exsolve gas
+        _, g_wet = QMagma.mixture_density(1e8, 1200.0, 0.8, ep)
+        _, g_dry = QMagma.mixture_density(1e8, 1200.0, 0.4, ep)
+        @test g_dry > g_wet
+    end
+
+    @testset "RK gas EOS (Huber 2010, item 1)" begin
+        @test QMagma.rho_gas_RK(1e8, 1123.15) > QMagma.rho_gas_RK(1e8, 1173.15)  # hotter -> lighter
+        @test QMagma.rho_gas_RK(3e8, 1123.15) > QMagma.rho_gas_RK(1e8, 1123.15)  # higher P -> denser
+        @test QMagma.rho_gas_RK(3e8, 1123.15) > 0
+        @test QMagma.rho_gas_RK(3e7, 1173.15) > 0                                 # positive over the box
+    end
+
+    @testset "Liu 2005 H₂O solubility (item 4)" begin
+        # mass-fraction form (reference exsolve_silicic.m includes the 1e-2 wt%->fraction factor)
+        meq(Pmpa) = 1e-2*((354.94*sqrt(Pmpa) + 9.623*Pmpa - 1.5223*Pmpa^1.5)/1200.0 + 1.2439e-3*Pmpa^1.5)
+        @test 0.03 < meq(200.0) < 0.07     # ~5 wt% at 200 MPa / 1200 K
+        @test meq(400.0) > meq(200.0)      # more soluble at higher P (monotone in range)
+        # the ported Liu m_eq must be the one mixture_density actually uses
+        ep = QMagma.EruptionParams()
+        ρ, _ = QMagma.mixture_density(2e8, 1200.0, 1.0, ep)  # all melt, m_eq drives the water split
+        @test isfinite(ρ) && ρ > 0
+    end
+
+    @testset "wall-T relaxation viscosity η_r (item 2a)" begin
+        ep = QMagma.EruptionParams()
+        @test QMagma.wall_relaxation_viscosity(ep, 500.0) > QMagma.wall_relaxation_viscosity(ep, 650.0)  # colder -> stiffer
+        @test 1e17 <= QMagma.wall_relaxation_viscosity(ep, 500.0) <= 1e24                                 # in clamp range
+        @test QMagma.wall_relaxation_viscosity(ep, 1200.0) == 1e17    # hot (mush-interior) wall clamps to the floor
+        @test QMagma.wall_relaxation_viscosity(ep, 300.0)  == 1e24    # very cold wall clamps to the ceiling
+    end
+
+    @testset "H₂O speciation diagnostics on EruptionState" begin
+        ep = QMagma.EruptionParams(m_w=0.05)
+        # partition splits total water: dissolved + exsolved == m_w when saturated (X_g>0)
+        m_diss, X_g, ρ_g, m_eq = QMagma.water_gas_partition(2e8, 1200.0, 0.7, ep)
+        @test m_diss ≈ m_eq*0.7
+        @test isapprox(m_diss + X_g, ep.m_w; atol=1e-12)   # water conserved while gas-saturated
+        @test ρ_g > 0
+        # crystallizing (ϕ_melt↓) exsolves more gas -> X_g rises (second boiling)
+        _, X_wet, _, _ = QMagma.water_gas_partition(2e8, 1200.0, 0.8, ep)
+        _, X_dry, _, _ = QMagma.water_gas_partition(2e8, 1200.0, 0.4, ep)
+        @test X_dry > X_wet
+        # mass fractions stay bounded even past Liu 2005's ~500 MPa calibration, where the
+        # raw saturation goes negative (it must not make X_g blow past m_w — the "3e4" bug)
+        for P in (1e9, 5e9, 2e10)
+            md, Xg, _, _ = QMagma.water_gas_partition(P, 1200.0, 0.7, ep)
+            @test 0 <= md <= ep.m_w && 0 <= Xg <= ep.m_w
+            @test isapprox(md + Xg, ep.m_w; atol=1e-12)
+        end
+        # step_overpressure! must populate the diagnostics on the state. Use a shallow chamber
+        # (~5 km, ~130 MPa) so the melt is water-saturated and X_g > 0; a deep chamber at high
+        # lithostatic P keeps all water dissolved (X_g = 0), which is correct but trivial.
+        st = QMagma.EruptionState(); QMagma.init_eruption!(st, ep, -5e3)
+        QMagma.step_overpressure!(st, ep, 1200.0+273.15, 0.7, 1000.0, 1e-9, 1e10)
+        @test st.m_diss > 0 && st.ρ_gas > 0 && st.X_g > 0
+        @test st.ϕ_mush == 0.7 && st.η_r == ep.η_r   # mush ϕ and wall viscosity recorded too
+    end
+
+    @testset "step_overpressure! nsub does not overflow Int64" begin
+        # a soft (floored) η_r + big ΔP + large Δt makes the raw sub-step count ≫ typemax(Int64);
+        # the clamp must happen in float space so ceil(Int, …) never sees the overflowing value
+        ep = QMagma.EruptionParams(η_r=1e17, ΔP_crit=20e6)
+        st = QMagma.EruptionState(); QMagma.init_eruption!(st, ep, -13e3)
+        st.P = st.P_lith + 100*ep.ΔP_crit          # far over threshold -> huge dPdt0
+        QMagma.step_overpressure!(st, ep, 1200.0+273.15, 0.8, 1000.0, 1e-9, 1e11)  # init
+        @test_nowarn QMagma.step_overpressure!(st, ep, 1200.0+273.15, 0.8, 1000.0, 1e-9, 1e11; z_centroid=-13e3)
+    end
+
+    @testset "V2: analytic overpressure relaxation" begin
+        # constant properties, no exsolution (m_w=0) and no recharge (ȧ=0): the master ODE
+        # reduces to dΔP/dt = -β_r·ΔP/η_r, i.e. exponential decay with τ = η_r/β_r.
+        ep = QMagma.EruptionParams(m_w=0.0, β_r=1e10, η_r=1e18)
+        τ  = ep.η_r/ep.β_r
+        st = QMagma.EruptionState(P_lith=2e8, P=2e8)
+        ΔP0 = 15e6; st.P = st.P_lith + ΔP0
+        Δt = τ/2000; nstep = 2000
+        QMagma.step_overpressure!(st, ep, 1200.0+273.15, 0.7, 100.0, 0.0, Δt)  # first call inits
+        for _ in 1:nstep
+            QMagma.step_overpressure!(st, ep, 1200.0+273.15, 0.7, 100.0, 0.0, Δt)
+        end
+        ΔP_num  = st.P - st.P_lith
+        ΔP_exact = ΔP0*exp(-nstep*Δt/τ)                # t = nstep·Δt = τ
+        @test isapprox(ΔP_num, ΔP_exact; rtol=2e-3)    # explicit Euler at Δt=τ/2000
+    end
+
+    @testset "column enthalpy drift across eruption closures (§2.1)" begin
+        Params, BC, N, Δ, T, z = QMagma.init_model(nz=201, L=40e3, Geotherm=20.0,
+                                                     Ttop=0.0, Tbot=800.0, Δt=200SecYear)
+        # a hot mobile mush embedded in the geotherm
+        T[(-17e3 .<= z .<= -13e3)] .= 1000.0
+        rocks = zeros(length(z))
+        MatParam = Params.MatParam
+        H0 = QMagma.column_enthalpy(T, z, MatParam, Params.Phases)
+
+        Tc, _ = QMagma.erupt_melt!(T, rocks, z; Erupt_z0=-15e3, Erupt_thick=800.0, method=:caldera)
+        Te, _ = QMagma.erupt_melt!(T, rocks, z; Erupt_z0=-15e3, Erupt_thick=800.0, method=:elastic)
+        Hc = QMagma.column_enthalpy(Tc, z, MatParam, Params.Phases)
+        He = QMagma.column_enthalpy(Te, z, MatParam, Params.Phases)
+
+        # both closures remove heat; caldera removes MORE (the full band leaves), elastic
+        # re-covers the vent with stretched host rock at its own T -> smaller heat debit.
+        # This quantifies the §2.1 energy-conservation gap of the intensive-T closures.
+        @test H0 - Hc > 0
+        @test H0 - He > 0
+        @test H0 - Hc > H0 - He
     end
 
 end
