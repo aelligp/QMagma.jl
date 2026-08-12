@@ -21,6 +21,7 @@ updates:
     directories:
       - "/"
       - "/test"
+      - "/docs"
     schedule:
       interval: "monthly"
     commit-message:

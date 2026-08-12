@@ -8,8 +8,9 @@ Interactive 1D thermal model of magmatic sill injection into the crust, with mel
 tracking, passive tracers (for zircon T-t histories via ZirconGrowth.jl), eruption
 mechanics, and a GLMakie GUI. Two side-by-side model flavors:
 
-- **Discrete sills**: individual sills injected at random depths every `Sill_int_yr`,
-  opening the column elastically (`insert_sill`).
+- **Discrete sills**: fixed-aperture sills injected at random depths whenever the
+  integrated flux history delivers another aperture, opening the column elastically
+  (`insert_sill`).
 - **Q_magma**: the same magma flux smeared into a steady volumetric source
   (`compute_Q_magma!` + `advect_w!`), after Karlstrom et al. (2017) / Mittal et al. (2021).
 
@@ -45,15 +46,15 @@ mechanics, and a GLMakie GUI. Two side-by-side model flavors:
 - Grid: `z` ascending, `z[1] = -L` (bottom, Dirichlet `Tbot`), `z[end] = 0` (surface,
   Dirichlet `Ttop`), uniform `Δz`. Temperatures in °C (converted to K only when calling
   GeoParams melting laws).
-- `rocks` is a binary (0/1) grid field marking intruded sill material — the grey band
-  in the GUI's melt-fraction axis. It is diagnostic, not part of the physics.
+- `rocks` is a nonnegative control-volume density of intruded-magma content. It can be
+  fractional at band edges and exceed one where material is compressed; the GUI clamps
+  only its display to `[0,1]`. It is diagnostic, not part of the thermal physics.
 - Melt fraction `ϕ` is a pure function of `T` (no composition/depletion state), so any
   eruption scheme can only suppress re-eruption by lowering `T`.
 - `Tracer` is a mutable struct; tracers are moved by mutating `tracer.z`.
-- Fields are moved by warping grid-point positions and re-interpolating onto the fixed
-  grid (`semilagrangian_advection`). **This transports intensive values**: where material
-  stretches, integrated content (heat, grey) is duplicated; where it compresses, content
-  is discarded. Every conservation statement below follows from this.
+- Temperature is moved by warping grid-point positions and re-interpolating onto the fixed
+  grid (`semilagrangian_advection`), which transports an intensive value. `rocks` uses
+  `conservative_advection`, which transports its integrated control-volume content.
 
 ## Eruption mechanics (hard-won semantics — read before touching)
 
@@ -64,7 +65,7 @@ decay radius). Only the melt content of the eruptible band leaves the column
 `h_melt` (or the elastic-storage release, below) and the erupted volume is
 `A_sill * h_erupt` — not the old `thickness³` cube.
 
-Two trigger types (GUI menu), each model (discrete / Q_magma) evaluated independently
+Three trigger types (GUI menu), each model (discrete / Q_magma) evaluated independently
 on its own ϕ:
 
 - **Melt-fraction threshold** (Caldera/Elastic/Hybrid menu items): largest contiguous
@@ -79,6 +80,10 @@ on its own ϕ:
   (~0.35% of chamber volume) is far smaller than one sill, so eruptions are
   injection-paced with volume ≈ recharge volume — the known elastically-limited regime,
   not a bug.
+- **D&H 3-phase**: uses one largest contiguous mush chamber. The silicic H₂O partition
+  and modified RK gas EOS are active only for chamber centroids in the upper 10 km;
+  deeper chambers are condensed melt + crystal with exactly zero represented free gas.
+  RK calls outside 30–400 MPa or 873.15–1173.15 K fail fast.
 
 Erupted tracers are extracted (`extract_erupted_tracers!`) for zircon statistics;
 remaining tracers and the Q_magma zone markers are moved with the same mechanism as the
@@ -94,20 +99,19 @@ Three closure mechanisms in `erupt_melt!(...; method=...)`:
 
 Constraint that shapes all of this (do not try to "fix" it): in a fixed-length column,
 removing the erupted `∫ρcpT` must be paid either in **volume** (a boundary moves →
-caldera/hybrid subsidence) or in **temperature** (stretched walls dilute — a
-conservative remap variant exists in `collapse_conservative`, currently unused because
-the local cooling was judged unphysical). Pure elastic closure with pinned ends
+caldera/hybrid subsidence) or in **temperature** (stretched walls dilute, with local
+cooling that was judged unphysical). Pure elastic closure with pinned ends
 necessarily conserves what it should remove; that is `:elastic`'s documented behavior,
 not a bug.
 
 Numerical invariants that must survive any change (property-test them): the warped grid
 `z .+ Displ` stays strictly monotonic (else interpolation silently corrupts); linear
-interpolation must not overshoot field bounds; `rocks` stays binary with no white hole
-inside the grey; eruption near domain edges is guarded by the GUI margin.
+interpolation must not overshoot field bounds; `rocks` stays finite and nonnegative and
+its integrated budget closes; eruption near domain edges is guarded by the GUI margin.
 
-`insert_sill` opens elastically (`crack_perp_displacement`, R = 5 km) and re-binarizes
-`rocks` with `round` — **not `ceil`**, which systematically inflated the grey band by a
-cell per boundary per injection (old bug, do not reintroduce).
+`insert_sill` opens elastically (`crack_perp_displacement`, R = 5 km), mixes `Sill_T`
+over the overlapped control volumes (including sub-grid sills), and adds exactly the
+specified sill content to `rocks`.
 
 ## Gotchas
 
@@ -115,7 +119,7 @@ cell per boundary per injection (old bug, do not reintroduce).
   "Possible method call error" (Information severity) — false positives, ignore.
 - The GUI simulation loop runs in `@async` with a `try/catch` that logs
   "Simulation loop failed"; errors there do not crash the window.
-- `mod(time/SecYear, Sill_int_yr) == 0` gates injection — changing Δt so it doesn't
-  divide the sill interval silently disables injection.
-- Grid-alignment: a band `abs.(z .- z0) .<= half` covers `2*half/Δz` **or one more**
-  cell depending on alignment; account for `length(ind)*Δz ≠ Erupt_thick` in tests.
+- Injection is keyed to cumulative delivered thickness via `sills_due`, so changing `Δt`
+  does not silently disable events.
+- Volume integrals use node-centered control volumes with half-width boundary cells;
+  never replace them with `sum(field)*Δz`, which adds one extra grid spacing.

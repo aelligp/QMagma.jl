@@ -1,6 +1,7 @@
 # GUI for GLMakie
 using GLMakie
-using JLD2
+
+include("ThermalExport.jl")
 
 export sill_intrusion_1D, compute_zircon_ages, volume_averaged_age
 
@@ -21,6 +22,101 @@ last_run_out = Dict{Symbol,Any}()
 add_textbox(fig, label, value) = [Label(fig, label), Textbox(fig, stored_string = string(value), validator = typeof(value), height=18, fontsize=11, textpadding=(4,4,2,2))]
 add_togglebox(fig, label, active) = [Label(fig, label), Toggle(fig, active=active, height=18)]
 get_valuebox(box::Vector) = parse(box[2].validator.val, box[2].stored_string.val)
+
+function gui_flux_history(mode; base_m_per_yr, peak_m_per_yr,
+                          start_kyr, end_kyr, table_path="")
+    if mode == "CSV table"
+        isempty(strip(table_path)) && throw(ArgumentError("Flux CSV path must not be empty"))
+        return load_flux_history(expanduser(strip(table_path)))
+    end
+    symbol = mode == "Constant" ? :constant :
+             mode == "Linear ramp" ? :ramp :
+             mode == "Pulse" ? :pulse :
+             throw(ArgumentError("unknown flux mode: $mode"))
+    return FluxHistory(symbol;
+        base=base_m_per_yr/SecYear,
+        peak=peak_m_per_yr/SecYear,
+        t_start=start_kyr*1000SecYear,
+        t_end=end_kyr*1000SecYear)
+end
+
+"""
+    eruption_control_state(trigger)
+
+Return which eruption controls apply to a selected eruption trigger. The sill radius,
+maximum eruption depth, and collapse mechanism apply to every active trigger: radius
+sets reported erupted volume, depth gates every trigger, and collapse acts after every
+eruption.
+"""
+function eruption_control_state(trigger)
+    trigger in ("None", "Melt thickness", "Elastic box model", "D&H 3-phase") ||
+        throw(ArgumentError("unknown eruption trigger: $trigger"))
+    active = trigger != "None"
+    pressure = trigger in ("Elastic box model", "D&H 3-phase")
+    return (; threshold = trigger == "Melt thickness", radius = active,
+              pressure, shear_modulus = pressure, magma_compressibility = pressure,
+              max_depth = active, collapse = active)
+end
+
+function eruption_fires(trigger; thickness, threshold, overpressure, pressure_critical,
+                        h_erupt, z_lo, z_hi, z_erupt_max, near_boundary, Δz)
+    trigger in ("Melt thickness", "Elastic box model", "D&H 3-phase") ||
+        throw(ArgumentError("unknown active eruption trigger: $trigger"))
+    triggered = trigger == "Melt thickness" ? thickness >= threshold :
+                trigger == "Elastic box model" ? overpressure >= pressure_critical :
+                h_erupt > 0
+    depth_ok = abs((z_lo + z_hi)/2) <= z_erupt_max
+    return triggered && depth_ok && !near_boundary && h_erupt > 2Δz
+end
+
+function collapse_surface_subsidence(method, h_erupt)
+    method in (:caldera, :elastic, :hybrid) ||
+        throw(ArgumentError("unknown eruption collapse method: $method"))
+    return method in (:caldera, :hybrid) ? h_erupt : 0.0
+end
+
+function set_textbox_enabled!(box, enabled)
+    label, textbox = box
+    label.color = enabled ? :black : (:gray, 0.55)
+    textbox.textcolor = enabled ? :black : (:gray, 0.65)
+    textbox.boxcolor = enabled ? :transparent : (:gray, 0.15)
+    textbox.boxcolor_hover = enabled ? :transparent : (:gray, 0.15)
+    textbox.boxcolor_focused = enabled ? :transparent : (:gray, 0.15)
+    textbox.bordercolor = enabled ? (:gray, 0.8) : (:gray, 0.45)
+    textbox.bordercolor_hover = enabled ? (:gray, 0.55) : (:gray, 0.45)
+    enabled || GLMakie.Makie.defocus!(textbox)
+    return nothing
+end
+
+function bind_textbox_enabled!(box, enabled)
+    textbox = box[2]
+    on(enabled) do active
+        set_textbox_enabled!(box, active)
+    end
+    on(textbox.focused) do focused
+        !enabled[] && focused && GLMakie.Makie.defocus!(textbox)
+    end
+    set_textbox_enabled!(box, enabled[])
+    return nothing
+end
+
+function set_menu_enabled!(menu, enabled)
+    menu.textcolor = enabled ? :black : (:gray, 0.55)
+    menu.dropdown_arrow_color = enabled ? (:black, 0.2) : (:gray, 0.45)
+    enabled || (menu.is_open[] = false)
+    return nothing
+end
+
+function bind_menu_enabled!(menu, enabled)
+    on(enabled) do active
+        set_menu_enabled!(menu, active)
+    end
+    on(menu.is_open) do open
+        !enabled[] && open && (menu.is_open[] = false)
+    end
+    set_menu_enabled!(menu, enabled[])
+    return nothing
+end
 
 """
     sill_intrusion_1D(; size=nothing)
@@ -55,7 +151,9 @@ function sill_intrusion_1D(; size=nothing)
     time_val = Observable(0.0)
     stop_requested = Observable(false)
     sim_running = Observable(false)
+    zircon_running = Observable(false)
     last_run = Dict{Symbol,Any}()
+    last_matparam = nothing
 
     Label(fig[0, 1:3], text = "1D Sill Injection", fontsize = 30)
 
@@ -106,44 +204,106 @@ function sill_intrusion_1D(; size=nothing)
     # η_r (wall relaxation viscosity) is computed analytically from the country-rock T each
     # step (wall_relaxation_viscosity), so no GUI knob for it — grid[5,3:4] left free.
 
-    Box(grid[6:8, 1:4], color = :lightyellow, cornerradius = 10)
+    Box(grid[6:11, 1:4], color = :lightyellow, cornerradius = 10)
     grid[6, 1:2] = Tsill_box    = add_textbox(fig,"Sill T [ᵒC]:",1200.0)
     grid[6, 3:4] = Sill_thick_box = add_textbox(fig,"Sill thick [m]:",100.0)
-    grid[7, 1:2] = Sill_interval_box = add_textbox(fig,"Sill interval [yrs]:",1000.0)
-    grid[8, 1:2] = Sill_interval_top_box = add_textbox(fig,"Top inj. [km]:",10.0)
-    grid[8, 3:4] = Sill_interval_bot_box = add_textbox(fig,"Bottom inj. [km]:",20.0)
+    grid[7, 1:4] = menu_flux = Menu(fig,
+        options = ["Constant", "Linear ramp", "Pulse", "CSV table"],
+        default = "Constant", height=18, fontsize=11)
+    grid[8, 1:2] = flux_base_box = add_textbox(fig,"Base flux [m/yr]:",0.1)
+    grid[8, 3:4] = flux_peak_box = add_textbox(fig,"Peak/end flux [m/yr]:",0.2)
+    grid[9, 1:2] = flux_start_box = add_textbox(fig,"Flux start [kyr]:",50.0)
+    grid[9, 3:4] = flux_end_box = add_textbox(fig,"Flux end [kyr]:",100.0)
+    grid[10, 1:4] = flux_table_box = [Label(fig, "Flux CSV path:"),
+        Textbox(fig, stored_string="flux.csv", height=18, fontsize=11,
+                textpadding=(4,4,2,2))]
+    grid[11, 1:2] = Sill_interval_top_box = add_textbox(fig,"Top inj. [km]:",10.0)
+    grid[11, 3:4] = Sill_interval_bot_box = add_textbox(fig,"Bottom inj. [km]:",20.0)
 
-    Box(grid[9:11, 1:4], color = (:red,0.3), cornerradius = 10 )
-    grid[9, 1:2] = Ql_box = add_textbox(fig,"Latent heat [kJ/kg]:",255.0)
-    grid[10, 1:4] = menu_conduct = Menu(fig, options = ["T-dependent conductivity", "Constant conductivity 3 W/m/K"], default = "Constant conductivity 3 W/m/K", height=18, fontsize=11)
-    grid[11, 1:4] = menu_melting = Menu(fig, options = ["MeltingParam_Assimilation", "MeltingParam_Basalt", "MeltingParam_Rhyolite"], default = "MeltingParam_Basalt", height=18, fontsize=11)
+    flux_base_enabled = Observable(true)
+    flux_peak_enabled = Observable(false)
+    flux_times_enabled = Observable(false)
+    flux_table_enabled = Observable(false)
+    bind_textbox_enabled!(flux_base_box, flux_base_enabled)
+    bind_textbox_enabled!(flux_peak_box, flux_peak_enabled)
+    bind_textbox_enabled!(flux_start_box, flux_times_enabled)
+    bind_textbox_enabled!(flux_end_box, flux_times_enabled)
+    bind_textbox_enabled!(flux_table_box, flux_table_enabled)
 
-    Box(grid[12:13, 1:4], color = (:orange,0.3), cornerradius = 10 )
-    grid[12, 1:4] = Label(fig, "Method:")
-    grid[13, 1:4] = menu_method = Menu(fig, options = ["Discrete sills", "Q_magma", "Both (compare)"], default = "Both (compare)", height=18, fontsize=11)
+    function update_flux_controls!(mode)
+        table = mode == "CSV table"
+        variable = mode in ("Linear ramp", "Pulse")
+        flux_base_enabled[] = !table
+        flux_peak_enabled[] = variable
+        flux_times_enabled[] = variable
+        flux_table_enabled[] = table
+        return nothing
+    end
+    on(update_flux_controls!, menu_flux.selection)
+    update_flux_controls!(menu_flux.selection[])
 
-    Box(grid[14:18, 1:4], color = (:purple,0.2), cornerradius = 10 )
+    Box(grid[12:14, 1:4], color = (:red,0.3), cornerradius = 10 )
+    grid[12, 1:2] = Ql_box = add_textbox(fig,"Latent heat [kJ/kg]:",255.0)
+    grid[13, 1:4] = menu_conduct = Menu(fig, options = ["T-dependent conductivity", "Constant conductivity 3 W/m/K"], default = "Constant conductivity 3 W/m/K", height=18, fontsize=11)
+    grid[14, 1:4] = menu_melting = Menu(fig, options = ["MeltingParam_Assimilation", "MeltingParam_Basalt", "MeltingParam_Rhyolite"], default = "MeltingParam_Basalt", height=18, fontsize=11)
+
+    Box(grid[15:16, 1:4], color = (:orange,0.3), cornerradius = 10 )
+    grid[15, 1:4] = Label(fig, "Method:")
+    grid[16, 1:4] = menu_method = Menu(fig, options = ["Discrete sills", "Q_magma", "Both (compare)"], default = "Both (compare)", height=18, fontsize=11)
+
+    Box(grid[17:21, 1:4], color = (:purple,0.2), cornerradius = 10 )
     # eruption is two independent choices: the TRIGGER (when the column erupts) and the
     # COLLAPSE kinematics (how the column closes the vent afterwards). Any trigger can be
     # paired with any collapse.
-    grid[14, 1:4] = Label(fig, "Eruption  trigger  |  collapse:")
-    grid[15, 1:2] = menu_trigger  = Menu(fig, options = ["None", "Melt thickness", "Elastic box model", "D&H 3-phase"], default = "None", height=18, fontsize=11)
-    grid[15, 3:4] = menu_collapse = Menu(fig, options = ["Hybrid", "Caldera", "Elastic"], default = "Hybrid", height=18, fontsize=11)
-    grid[16, 1:2] = Eruption_thick_box = add_textbox(fig,"Threshold [m]:",500.0)
-    grid[16, 3:4] = Sill_radius_box    = add_textbox(fig,"Sill radius [km]:",5.0)
-    grid[17, 1:2] = dPc_box            = add_textbox(fig,"ΔP crit [MPa]:",20.0)
-    grid[17, 3:4] = mu_box             = add_textbox(fig,"μ shear [GPa]:",10.0)
-    grid[18, 1:2] = beta_box           = add_textbox(fig,"β magma [1/GPa]:",0.1)
-    grid[18, 3:4] = zmax_box           = add_textbox(fig,"Max erupt depth [km]:",15.0)
+    grid[17, 1:4] = Label(fig, "Eruption  trigger  |  collapse:")
+    grid[18, 1:2] = menu_trigger  = Menu(fig, options = ["None", "Melt thickness", "Elastic box model", "D&H 3-phase"], default = "None", height=18, fontsize=11)
+    grid[18, 3:4] = menu_collapse = Menu(fig, options = ["Hybrid", "Caldera", "Elastic"], default = "Hybrid", height=18, fontsize=11)
+    grid[19, 1:2] = Eruption_thick_box = add_textbox(fig,"Threshold [m]:",500.0)
+    grid[19, 3:4] = Sill_radius_box    = add_textbox(fig,"Sill radius [km]:",5.0)
+    grid[20, 1:2] = dPc_box            = add_textbox(fig,"ΔP crit [MPa]:",20.0)
+    grid[20, 3:4] = mu_box             = add_textbox(fig,"μ shear [GPa]:",10.0)
+    grid[21, 1:2] = beta_box           = add_textbox(fig,"β magma [1/GPa]:",0.1)
+    grid[21, 3:4] = zmax_box           = add_textbox(fig,"Max erupt depth [km]:",15.0)
 
-    Box(grid[19:22, 1:4], color = (:green,0.3), cornerradius = 10 )
-    grid[19, 1:2] = filename = [Label(fig, "filename:"), Textbox(fig, stored_string = "sim1", height=18, fontsize=11, textpadding=(4,4,2,2))]
-    grid[20, 1:2] = but_save =  Button(fig, label = "  SAVE SCREENSHOT  ", buttoncolor = (:lightgreen, 0.5), height=18, fontsize=11)
-    grid[20, 3:4] = but_save_data = Button(fig, label = "  SAVE DATA  ", buttoncolor = (:lightgreen, 0.5), height=18, fontsize=11)
-    grid[21, 1:2] = record_toggle = add_togglebox(fig,"Record movie:",false)
-    grid[22, 1:4] = but_zircon = Button(fig, label = "  COMPUTE ZIRCON AGES  ", buttoncolor = (:lightgreen, 0.5), height=18, fontsize=11)
+    # Grey inactive eruption inputs and prevent focus/opening, so the selected trigger
+    # is the only source of applicable settings.
+    threshold_enabled = Observable(false)
+    radius_enabled    = Observable(false)
+    pressure_enabled  = Observable(false)
+    shear_enabled     = Observable(false)
+    compressibility_enabled = Observable(false)
+    depth_enabled     = Observable(false)
+    collapse_enabled  = Observable(false)
+    bind_textbox_enabled!(Eruption_thick_box, threshold_enabled)
+    bind_textbox_enabled!(Sill_radius_box, radius_enabled)
+    bind_textbox_enabled!(dPc_box, pressure_enabled)
+    bind_textbox_enabled!(mu_box, shear_enabled)
+    bind_textbox_enabled!(beta_box, compressibility_enabled)
+    bind_textbox_enabled!(zmax_box, depth_enabled)
+    bind_menu_enabled!(menu_collapse, collapse_enabled)
 
-    for r in 1:22
+    function update_eruption_controls!(trigger)
+        controls = eruption_control_state(trigger)
+        threshold_enabled[] = controls.threshold
+        radius_enabled[] = controls.radius
+        pressure_enabled[] = controls.pressure
+        shear_enabled[] = controls.shear_modulus
+        compressibility_enabled[] = controls.magma_compressibility
+        depth_enabled[] = controls.max_depth
+        collapse_enabled[] = controls.collapse
+        return nothing
+    end
+    on(update_eruption_controls!, menu_trigger.selection)
+    update_eruption_controls!(menu_trigger.selection[])
+
+    Box(grid[22:25, 1:4], color = (:green,0.3), cornerradius = 10 )
+    grid[22, 1:2] = filename = [Label(fig, "filename:"), Textbox(fig, stored_string = "sim1", height=18, fontsize=11, textpadding=(4,4,2,2))]
+    grid[23, 1:2] = but_save =  Button(fig, label = "  SAVE SCREENSHOT  ", buttoncolor = (:lightgreen, 0.5), height=18, fontsize=11)
+    grid[23, 3:4] = but_save_data = Button(fig, label = "  SAVE JLD2 + VTK  ", buttoncolor = (:lightgreen, 0.5), height=18, fontsize=11)
+    grid[24, 1:2] = record_toggle = add_togglebox(fig,"Record movie:",false)
+    grid[25, 1:4] = but_zircon = Button(fig, label = "  COMPUTE ZIRCON AGES  ", buttoncolor = (:lightgreen, 0.5), height=18, fontsize=11)
+
+    for r in 1:25
         rowsize!(grid, r, Fixed(18))
     end
 
@@ -157,9 +317,45 @@ function sill_intrusion_1D(; size=nothing)
         if isempty(last_run)
             println("No simulation data to save yet - run the simulation first")
         else
-            jld2_name = filename[2].stored_string.val * ".jld2"
+            base_name = filename[2].stored_string.val
+            jld2_name = base_name * ".jld2"
             jldsave(jld2_name; last_run...)
-            println("Saved data to $(joinpath(pwd(), jld2_name))")
+            vtk_names = String[]
+            matparam = last_matparam
+            isnothing(matparam) && error("No material parameters available for 2D/3D melt-fraction export")
+            sigma = last_run[:gaussian_sigma]
+            x2 = range(-3sigma, 3sigma; length=41)
+            x3 = range(-3sigma, 3sigma; length=21)
+            for (label, temperature_key) in (("discrete", :T), ("Qmagma", :T_Qmagma))
+                haskey(last_run, temperature_key) || continue
+                temperature = last_run[temperature_key]
+                if temperature_key === :T
+                    append!(vtk_names, export_thermal_structure(base_name * "_" * label, last_run[:z];
+                        fields=(temperature, melt_fraction=last_run[:phi], rocks=last_run[:rocks]),
+                        formats=(:vtk,)))
+                else
+                    append!(vtk_names, export_thermal_structure(base_name * "_" * label, last_run[:z];
+                        fields=(temperature, melt_fraction=last_run[:phi_Qmagma]), formats=(:vtk,)))
+                end
+                T2 = gaussian_thermal_structure(temperature, last_run[:T_background], x2; sigma)
+                T3 = gaussian_thermal_structure(temperature, last_run[:T_background], x3; y=x3, sigma)
+                ϕ2 = melt_fraction_from_temperature(T2, matparam)
+                ϕ3 = melt_fraction_from_temperature(T3, matparam)
+                fields2 = (temperature=T2, melt_fraction=ϕ2)
+                fields3 = (temperature=T3, melt_fraction=ϕ3)
+                if temperature_key === :T
+                    rocks = last_run[:rocks]
+                    rocks2 = (abs.(x2) .<= sigma) .* reshape(rocks, 1, :)
+                    rocks3 = ((x3.^2 .+ (x3').^2) .<= sigma^2) .* reshape(rocks, 1, 1, :)
+                    fields2 = (; fields2..., rocks=rocks2)
+                    fields3 = (; fields3..., rocks=rocks3)
+                end
+                append!(vtk_names, export_thermal_structure(base_name * "_" * label * "_2d", last_run[:z];
+                    x=x2, fields=fields2, formats=(:vtk,)))
+                append!(vtk_names, export_thermal_structure(base_name * "_" * label * "_3d", last_run[:z];
+                    x=x3, y=x3, fields=fields3, formats=(:vtk,)))
+            end
+            println("Saved data to $(joinpath(pwd(), jld2_name)) and $(join(vtk_names, ", "))")
         end
     end
 
@@ -171,22 +367,27 @@ function sill_intrusion_1D(; size=nothing)
     on(but_zircon.clicks) do n
         if sim_running[]
             println("Simulation is still finishing up - wait until it stops completely before computing zircon ages")
+        elseif zircon_running[]
+            println("Zircon ages are already being computed")
         elseif isempty(tracers_out)
             println("No tracer data yet - run the simulation first")
         else
-            # compute_zircon_ages is CPU-heavy (and itself multi-threaded via
-            # Threads.@threads), so run it off the GLMakie event thread - calling it
-            # directly from this callback can starve/destabilize the render loop and
-            # has been observed to kill the GUI window.
-            @async try
-                cargo = erupted_tracers_out
-                println("Computing zircon ages for $(length(tracers_out)) reservoir tracers + $(length(cargo)) erupted-cargo tracers on $(Threads.nthreads()) thread(s)...")
-                # shared reference clock so reservoir and erupted-cargo spectra are directly
-                # comparable: erupted-cargo histories stop at eruption time, and passing a
-                # common t_ref offsets those ages onto the same present-day datum
-                t_ref = maximum((tr.time_vec[end] for tr in tracers_out if length(tr.time_vec) >= 2); init=0.0)
-                zircon_result = compute_zircon_ages(tracers_out; nx=50, t_ref_Myr=t_ref)
+            zircon_running[] = true
+            reservoir = copy(tracers_out)
+            cargo = copy(erupted_tracers_out)
+            Threads.nthreads() == 1 && println("Zircon calculation uses the only Julia thread; restart with `julia -t auto` to keep the GUI responsive")
+            println("Computing zircon ages for $(length(reservoir)) reservoir tracers + $(length(cargo)) erupted-cargo tracers on $(Threads.nthreads()) thread(s)...")
+            worker = Threads.@spawn begin
+                t_ref = maximum((tr.time_vec[end] for tr in reservoir if length(tr.time_vec) >= 2); init=0.0)
+                zircon_result = compute_zircon_ages(reservoir; nx=50, t_ref_Myr=t_ref)
                 cargo_result  = isempty(cargo) ? nothing : compute_zircon_ages(cargo; nx=50, t_ref_Myr=t_ref)
+                return zircon_result, cargo_result
+            end
+
+            # Keep all GLMakie calls on the GUI task. `@async` alone is cooperative and
+            # cannot make CPU-bound work responsive; it only waits for the worker here.
+            @async try
+                zircon_result, cargo_result = fetch(worker)
                 if !isempty(zircon_result.age_years)
                     last_run[:zircon_age_years]    = zircon_result.age_years
                     last_run[:zircon_radius_um]    = zircon_result.zircon_radius_um
@@ -237,6 +438,8 @@ function sill_intrusion_1D(; size=nothing)
                 end
             catch err
                 @error "Zircon age computation failed" exception=(err, catch_backtrace())
+            finally
+                zircon_running[] = false
             end
         end
     end
@@ -253,7 +456,10 @@ function sill_intrusion_1D(; size=nothing)
         SecYear     = 3600*24*365.25
         Δz          = get_valuebox(Δz_box)
         H           = get_valuebox(H_box)
-        nz          = floor(Int64, H*1e3/Δz)
+        H > 0 || throw(ArgumentError("Crustal thickness must be positive"))
+        Δz > 0 || throw(ArgumentError("Grid spacing must be positive"))
+        nz          = round(Int, H*1e3/Δz) + 1
+        nz >= 2 || throw(ArgumentError("Grid spacing must not exceed crustal thickness"))
         nt          = get_valuebox(nt_box)
         γ           = get_valuebox(γ_box)
         Tsill       = get_valuebox(Tsill_box)
@@ -262,7 +468,15 @@ function sill_intrusion_1D(; size=nothing)
         Silltop     = get_valuebox(Sill_interval_top_box)
         Sillbot     = get_valuebox(Sill_interval_bot_box)
         Sillthick   = get_valuebox(Sill_thick_box)
-        Sill_int_yr = get_valuebox(Sill_interval_box)
+        0 <= Silltop < Sillbot <= H || throw(ArgumentError(
+            "Injection depths must satisfy 0 ≤ top < bottom ≤ crustal thickness"))
+        Sillthick > 0 || throw(ArgumentError("Sill thickness must be positive"))
+        ȧ = gui_flux_history(menu_flux.selection[];
+            base_m_per_yr=get_valuebox(flux_base_box),
+            peak_m_per_yr=get_valuebox(flux_peak_box),
+            start_kyr=get_valuebox(flux_start_box),
+            end_kyr=get_valuebox(flux_end_box),
+            table_path=flux_table_box[2].stored_string.val)
         Ql          = get_valuebox(Ql_box)*1e3
         method      = menu_method.selection[]
         run_discrete = method=="Discrete sills" || method=="Both (compare)"
@@ -270,6 +484,11 @@ function sill_intrusion_1D(; size=nothing)
 
         # eruption = trigger (when) + collapse (how the vent closes); chosen independently
         trigger_method  = menu_trigger.selection[]
+        if trigger_method == "D&H 3-phase" &&
+           menu_melting.selection[] != "MeltingParam_Rhyolite"
+            throw(ArgumentError(
+                "D&H 3-phase uses the Liu silicic H₂O law; select MeltingParam_Rhyolite"))
+        end
         collapse_method = menu_collapse.selection[]
         erupt_mode      = collapse_method == "Elastic" ? :elastic :
                           collapse_method == "Caldera" ? :caldera : :hybrid
@@ -287,7 +506,8 @@ function sill_intrusion_1D(; size=nothing)
         # D&H 3-phase overpressure trigger: one lumped chamber state per model. η_r (wall
         # relaxation viscosity) is no longer a knob — it is recomputed each step from the
         # country-rock T (wall_relaxation_viscosity); the struct default is just a placeholder.
-        erupt_params  = EruptionParams(ΔP_crit=ΔPc, ϕ_erupt=0.5, z_erupt_max=z_erupt_max, β_r=1.0/β_eff)
+        erupt_params = EruptionParams(ΔP_crit=ΔPc, ϕ_erupt=0.5,
+            z_erupt_max=z_erupt_max, z_gas_max=10e3, β_r=1.0/β_eff)
 
 
         conductivity = T_Conductivity_Whittington()
@@ -305,54 +525,50 @@ function sill_intrusion_1D(; size=nothing)
         end
 
 
-        MatParam     = (SetMaterialParams(Name="RockMelt", Phase=0,
-                                        Density         = ConstantDensity(ρ=2700kg/m^3),                            # used in the parameterisation of Whittington
-                                        LatentHeat      = ConstantLatentHeat(Q_L=Ql*J/kg),
-                                        RadioactiveHeat = ExpDepthDependentRadioactiveHeat(H_0=0e-7Watt/m^3),
-                                        Conductivity    = conductivity,                             #  T-dependent k
-                                        HeatCapacity    = heatcapacity,                             # T-dependent cp
-                                        Melting         = melting                                   # Quadratic parameterization as in Tierney et al.
-        ),)
-
-
-
         @info "parameters" nz, H, γ, Tsill, Ttop, nt
         Tbot = Ttop +   H*γ
 
-        # setup model
-        Params, BC, N, Δ, T, z = init_model(nz=nz, L=H*1e3, Geotherm=γ, Ttop=Ttop, Tbot=Tbot, Δt=Δt, MatParam=MatParam)
+        # setup model. init_model assembles the single MatParam every entry point shares;
+        # the host-rock thermal density comes from the same parameter object as the chamber's
+        # crustal density, and check_density_consistency refuses a run where the two differ.
+        Params, BC, N, Δ, T, z = init_model(nz=nz, L=H*1e3, Geotherm=γ, Ttop=Ttop, Tbot=Tbot, Δt=Δt,
+                                            ρ=erupt_params.ρ_crust, Q_L=Ql,
+                                            Conductivity=conductivity, HeatCapacity=heatcapacity,
+                                            Melting=melting)
+        MatParam = Params.MatParam
+        last_matparam = MatParam
+        check_density_consistency(MatParam, erupt_params)
+        Δz = Δ[1]
+        T_background = copy(T)
 
         # second model, evolved with an equivalent steady volumetric source Q_magma
         # instead of discrete sill injection (compared side-by-side in the plots below)
         Params_Q = deepcopy(Params)
         T_Q      = deepcopy(T)
         Params_Q.Told .= T_Q
-        ȧ        = Sillthick/Sill_int_yr/SecYear   # time-averaged accretion rate [m/s]
+        # One accretion history drives both emplacement models. Each step's exactly
+        # integrated thickness becomes whole sills in the discrete branch and a step-mean
+        # source rate in the Q_magma branch.
+        A_inj    = 0.0                             # cumulative injected thickness [m]
 
         rocks = zero(T) # will later contain locations with injected sills
+        # same indicator for the smeared branch: magma arrives spread over the injection
+        # zone rather than as a sill, and is advected by the same host-rock velocity
+        rocks_Q = zero(T_Q)
+        zone_lo, zone_hi = -Sillbot*1e3, -Silltop*1e3
 
         # injection-zone boundary markers, advected by Params_Q.w so the dashed lines
         # on ax2 show how far the host rock at the zone edges has moved under Q_magma
         zone_markers = [-Silltop*1e3, -Sillbot*1e3]
 
-        # passive tracers: discrete sills take priority when both methods run, since
-        # only one tracer set is tracked per run (advect_tracers_sill! vs advect_tracers!
-        # use unrelated displacement mechanisms and can't be mixed for the same tracers)
-        track_discrete_tracers = run_discrete
-        tracers = init_tracers(Silltop, Sillbot)
+        # Each model owns its tracer population. Sharing one population would make a
+        # Q_magma event impossible to reconcile while the same tracers follow discrete
+        # sill displacements (and vice versa).
+        tracers = run_discrete ? init_tracers(Silltop, Sillbot) : Tracer[]
+        tracers_Q = run_Qmagma ? init_tracers(Silltop, Sillbot) : Tracer[]
         erupted_tracers = Tracer[]
-
-        # add initial perturbation (if any)
-        T_cen =  (Silltop + Sillbot)/2*1e3
-
-        if run_discrete
-            ind = findall( abs.(z .+ T_cen) .< Sillthick/2)
-            if !isempty(ind)
-                T[ind] .= Tsill
-                rocks[ind] .= 1
-            end
-            Params.Told .= T
-        end
+        erupted_tracers_Q = Tracer[]
+        rng = Random.default_rng()
 
         # create initial plot
         PlotData = (;ax1, ax2, fig)
@@ -379,11 +595,7 @@ function sill_intrusion_1D(; size=nothing)
         if run_discrete && run_Qmagma
             axislegend(ax1, position=:lb)
         end
-        if run_discrete
-            ax1.limits=(minimum(T)-10, maximum(T)+10,extrema(z/1e3)...)
-        else
-            ax1.limits=(minimum(T)-10, Tsill+10,extrema(z/1e3)...)
-        end
+        ax1.limits=(minimum(T)-10, Tsill+100, extrema(z/1e3)...)
         empty!(ax2)
         if run_discrete
             lines!(ax2, ϕplot,  z/1e3, color=:blue)
@@ -403,23 +615,51 @@ function sill_intrusion_1D(; size=nothing)
         colors      =   matrix_colors(Jac)
 
         time_vec  = Float64[]
+        flux_vec  = Float64[]
         Tmax_vec  = Float64[]
         ϕmax_vec  = Float64[]
         TQmax_vec = Float64[]
         ϕQmax_vec = Float64[]
 
-        # cumulative erupted volume [km^3], assuming each eruption event empties a cube
-        # whose edge length is the erupted thickness (Erupt_thick^3)
+        # Cumulative physically withdrawn volume [km³] and realized event history.
         erupted_volume = 0.0
         erupted_volume_vec = Float64[]
         eruption_event_time_vec   = Float64[]   # time [kyrs] of each individual eruption
         eruption_event_volume_vec = Float64[]   # volume [km^3] of that single event
+        collapse_event_time_vec = Float64[]     # time [kyrs] of each physical column closure
+        collapse_event_thickness_vec = Float64[] # closure amplitude [m]
+        surface_subsidence = 0.0
+        surface_subsidence_vec = Float64[]
+        eruption_trigger_time_vec   = Float64[] # D&H drainage times [kyrs], including sub-grid drainage
+        eruption_trigger_volume_vec = Float64[] # drained volume [km³] during each thermal step
         # same bookkeeping for the Q_magma model, which erupts independently based on
         # its own melt fraction
         erupted_volume_Q = 0.0
         erupted_volume_Q_vec = Float64[]
         eruption_event_time_Q_vec   = Float64[]
         eruption_event_volume_Q_vec = Float64[]
+        collapse_event_time_Q_vec = Float64[]
+        collapse_event_thickness_Q_vec = Float64[]
+        surface_subsidence_Q = 0.0
+        surface_subsidence_Q_vec = Float64[]
+        eruption_trigger_time_Q_vec   = Float64[]
+        eruption_trigger_volume_Q_vec = Float64[]
+        eruption_events = EruptionEvent[]
+        eruption_events_Q = EruptionEvent[]
+
+        enthalpy_budget = EnthalpyBudget(column_enthalpy(T, z, MatParam, Params.Phases))
+        enthalpy_budget_Q = EnthalpyBudget(column_enthalpy(T_Q, z, MatParam, Params_Q.Phases))
+        enthalpy_budget_vec = NamedTuple[]
+        enthalpy_budget_Q_vec = NamedTuple[]
+
+        # melt content of the starting geotherm: Params.ϕ is only filled by the first
+        # nonlinear solve, and the budget needs the state it starts from
+        compute_meltfraction!(Params.ϕ, MatParam, Params.Phases, (T = Params.Told .+ 273.15,))
+        compute_meltfraction!(Params_Q.ϕ, MatParam, Params_Q.Phases, (T = Params_Q.Told .+ 273.15,))
+        mass_budget = MassBudget(integrated_content(rocks, z), melt_thickness(Params.ϕ, z, z[1], z[end]))
+        mass_budget_Q = MassBudget(integrated_content(rocks_Q, z), melt_thickness(Params_Q.ϕ, z, z[1], z[end]))
+        mass_budget_vec = NamedTuple[]
+        mass_budget_Q_vec = NamedTuple[]
 
         # D&H chamber diagnostics vs time (per model). Only pushed when the D&H trigger runs,
         # so length matches time_vec in that mode; empty otherwise. Exported in last_run (JLD2)
@@ -437,12 +677,11 @@ function sill_intrusion_1D(; size=nothing)
         erupt_state   = EruptionState()
         erupt_state_Q = EruptionState()
 
-        Sill_z0 = -20e3;
-        println("Injecting sill @ z=$Sill_z0")
+        Sill_z0 = NaN
 
         # perform timestepping
-        crust_added =  Sillthick/1e3
-        crust_added_numerics = sum(rocks)*Δz/1e3
+        crust_added = 0.0
+        crust_added_numerics = integrated_content(rocks, z)/1e3
         F_Q = zero(T_Q)
 
         recording = record_toggle[2].active[]
@@ -476,20 +715,49 @@ function sill_intrusion_1D(; size=nothing)
                 break
             end
 
+            Δh = injected_thickness(ȧ, time, Params.Δt)
+            n_injections = sills_due(A_inj, Δh, Sillthick)
+            A_inj += Δh
+            ȧ_step = Δh/Params.Δt          # step-mean accretion rate for the smeared branch
+            push!(flux_vec, ȧ_step*SecYear)
+            ȧ_discrete = n_injections*Sillthick/Params.Δt
+            boundary_step = 0.0
+            injected_step = 0.0
+            source_step = 0.0
+            erupted_step = 0.0
+            boundary_step_Q = 0.0
+            injected_step_Q = 0.0
+            source_step_Q = 0.0
+            erupted_step_Q = 0.0
+            magma_in_step = 0.0
+            magma_out_step = 0.0
+            melt_out_step = 0.0
+            magma_in_step_Q = 0.0
+            magma_out_step_Q = 0.0
+            melt_out_step_Q = 0.0
+
             if run_discrete
                 T,  converged, its = nonlinear_solution(F, T, Jac, colors, verbose=false, Δ=Δ, N=N, BC=BC, Params=Params, MatParam=MatParam)
+                converged || error("Discrete thermal solve failed to converge at timestep $t after $its iterations")
+                boundary_step += conductive_boundary_energy(T, Params.k, z, Params.Δt)
+                source_step += source_energy(Params.Q, z, Params.Δt)
+                compute_meltfraction!(Params.ϕ, MatParam, Params.Phases, (T = T .+ 273.15,))
 
-                if mod(time/SecYear, Sill_int_yr)==0 && t>1
+                for _ in 1:n_injections
 
-                    Sill_z0 = rand(-Sillbot*1e3:1:-Silltop*1e3)
+                    Sill_z0 = rand(rng, -Sillbot*1e3:1:-Silltop*1e3)
+                    T_host = linear_interpolation(z, T)(Sill_z0)
+                    injected_step += magma_heat_input(T_host, Tsill, Sillthick, MatParam)
 
-                    T, rocks = insert_sill(T,rocks, z, Sill_thick=Sillthick, Sill_z0=Sill_z0, Sill_T=Tsill)
+                    T, rocks, magma_lost = insert_sill(T,rocks, z, Sill_thick=Sillthick, Sill_z0=Sill_z0, Sill_T=Tsill)
+                    magma_in_step += Sillthick
+                    magma_out_step += magma_lost
                     Params.Told .= T
+                    compute_meltfraction!(Params.ϕ, MatParam, Params.Phases,
+                        (T = Params.Told .+ 273.15,))
 
-                    if track_discrete_tracers
-                        advect_tracers_sill!(tracers, Sill_z0, Sillthick)
-                        add_sill_tracers!(tracers, Sill_z0, Sillthick, Tsill)
-                    end
+                    advect_tracers_sill!(tracers, Sill_z0, Sillthick)
+                    add_sill_tracers!(tracers, Sill_z0, Sillthick, Tsill)
 
                     if trigger_method == "Elastic box model"
                         # a sill injected into an existing mush pressurizes the chamber
@@ -502,39 +770,51 @@ function sill_intrusion_1D(; size=nothing)
                     end
 
                     crust_added += Sillthick/1e3
-                    crust_added_numerics = sum(rocks)*Δz/1e3
+                    crust_added_numerics = integrated_content(rocks, z)/1e3
                     println("Injecting sill @ z=$Sill_z0")
                 end
                 Params.Told .= T
+                compute_meltfraction!(Params.ϕ, MatParam, Params.Phases,
+                    (T = Params.Told .+ 273.15,))
             end
 
             if run_Qmagma
                 # same physics, but with sills smeared into a steady
                 # volumetric source Q_magma instead of discrete injection events
-                compute_Q_magma!(Params_Q, MatParam, z; Tsill=Tsill, ȧ=ȧ, Silltop=Silltop, Sillbot=Sillbot)
+                compute_Q_magma!(Params_Q, MatParam, z; Tsill=Tsill, ȧ=ȧ_step, Silltop=Silltop, Sillbot=Sillbot)
+                # the injected-magma indicator rides the same host-rock displacement as the
+                # column, then takes this step's smeared delivery spread over the zone
+                rocks_Q_adv = conservative_advection(rocks_Q, Params_Q.w .* Params_Q.Δt, z)
+                magma_out_step_Q += integrated_content(rocks_Q, z) - integrated_content(rocks_Q_adv, z)
+                rocks_Q = rocks_Q_adv
+                add_uniform_content!(rocks_Q, z, zone_lo, zone_hi, Δh)
+                magma_in_step_Q += Δh
                 advect_w!(Params_Q)   # semi-Lagrangian host-rock displacement, as with discrete sills
+                compute_Q_magma!(Params_Q, MatParam, z; Tsill=Tsill, ȧ=ȧ_step, Silltop=Silltop, Sillbot=Sillbot)
                 advect_markers!(zone_markers, Params_Q)
-                if !track_discrete_tracers
-                    advect_tracers!(tracers, Params_Q)
-                    if mod(time/SecYear, Sill_int_yr)==0 && t>1
-                        # replenish tracers at the zone center, since host rock is
-                        # continuously advected away from it under Q_magma
-                        add_zone_tracers!(tracers, Silltop, Sillbot, Tsill)
-                    end
+                advect_tracers!(tracers_Q, Params_Q)
+                for _ in 1:n_injections
+                    # replenish tracers at the zone center, since host rock is
+                    # continuously advected away from it under Q_magma
+                    add_zone_tracers!(tracers_Q, Silltop, Sillbot, Tsill)
                 end
                 T_Q, converged_Q, its_Q = nonlinear_solution(F_Q, T_Q, Jac, colors, verbose=false, Δ=Δ, N=N, BC=BC, Params=Params_Q, MatParam=MatParam)
+                converged_Q || error("Q_magma thermal solve failed to converge at timestep $t after $its_Q iterations")
+                boundary_step_Q += conductive_boundary_energy(T_Q, Params_Q.k, z, Params_Q.Δt)
+                source_step_Q += source_energy(Params_Q.Q, z, Params_Q.Δt)
                 Params_Q.Told .= T_Q
+                compute_meltfraction!(Params_Q.ϕ, MatParam, Params_Q.Phases,
+                    (T = Params_Q.Told .+ 273.15,))
             end
 
             time += Params.Δt
             time_kyrs = time/SecYear/1e3
             time_Myr  = time_kyrs/1e3
 
-            if track_discrete_tracers
+            if run_discrete
                 update_tracers_T!(tracers, T, z, time_Myr, Params.ϕ)
-            else
-                update_tracers_T!(tracers, T_Q, z, time_Myr, Params_Q.ϕ)
             end
+            run_Qmagma && update_tracers_T!(tracers_Q, T_Q, z, time_Myr, Params_Q.ϕ)
 
             dh_mode = false   # hoisted so it's in scope for the chamber-diagnostics push below
             if trigger_method != "None"
@@ -577,58 +857,60 @@ function sill_intrusion_1D(; size=nothing)
                                 # sub-steps the overpressure ODE and drains internally on every
                                 # ΔP≥ΔP_crit crossing (depth + gas-lock gated); erupt_state.h_erupt
                                 # is the total drained melt this step, mass-conserving (=recharge)
-                                step_overpressure!(erupt_state, erupt_params, T_mush_K, ϕ_mush, V_e, ȧ, Params.Δt; z_centroid=zc_dh)
+                                step_overpressure!(erupt_state, erupt_params, T_mush_K, ϕ_mush, V_e, ȧ_discrete, Params.Δt; z_centroid=zc_dh)
                             end
                         end
-                        # D&H: the drained melt this step (already depth/gas-lock/ΔP_crit gated
-                        # inside step_overpressure!); box: elastic storage; threshold: whole band
+                        h_requested = dh_mode ? erupt_state.h_erupt : 0.0
+                        if h_requested > 0
+                            push!(eruption_trigger_time_vec, time_kyrs)
+                            push!(eruption_trigger_volume_vec, A_sill*h_requested/1e9)
+                        end
+                        # D&H queues sub-grid drainage until the physical withdrawal is
+                        # resolvable; box uses elastic storage; threshold erupts the whole band.
                         h_erupt = box_mode ? min(β_eff*thickness*P_over, h_melt) :
-                                  dh_mode  ? min(erupt_state.h_erupt, h_melt) : h_melt
-                        trigger = box_mode ? (P_over >= ΔPc) :
-                                  dh_mode  ? (erupt_state.h_erupt > 0) :
-                                             (thickness >= Eruption_thick)
-                        # max eruption depth applies to ALL trigger types (dikes from too
-                        # deep a chamber can't reach the surface); D&H also checks it internally
-                        depth_ok  = abs((z_lo + z_hi)/2) <= z_erupt_max
-                        resolvable = h_erupt > 2*Δz   # band thick enough for erupt_melt! to collapse on the grid
-                        # An eruption is defined by the trigger (D&H: ΔP≥ΔP_crit), NOT by grid
-                        # resolution: D&H's small events are genuinely sub-grid in 1D thickness.
-                        # So D&H fires whenever triggered (records volume + resets ΔP), and only
-                        # does the physical band-collapse + cargo extraction when resolvable.
-                        # Box/threshold triggers produce resolvable bands, so keep their gate.
-                        fires = trigger && depth_ok && !near_boundary && h_erupt > 0 &&
-                                (dh_mode || resolvable)
+                                  dh_mode  ? pending_withdrawal!(erupt_state, h_requested, h_melt, Δz; time) : h_melt
+                        # Maximum depth applies to every trigger; D&H checks it internally too.
+                        fires = eruption_fires(trigger_method; thickness, threshold=Eruption_thick,
+                            overpressure=P_over, pressure_critical=ΔPc, h_erupt, z_lo, z_hi,
+                            z_erupt_max, near_boundary, Δz)
                         if fires
                             Erupt_z0 = (z_lo + z_hi)/2
-                            if resolvable
-                                sills_before = sum(rocks)*Δz
-                                H_before = column_enthalpy(T, z, MatParam, Params.Phases)   # §2.1 energy-conservation diagnostic
-                                T, rocks = erupt_melt!(T, rocks, z; Erupt_z0=Erupt_z0, Erupt_thick=h_erupt, method=erupt_mode)
-                                sills_after = sum(rocks)*Δz
-                                H_after  = column_enthalpy(T, z, MatParam, Params.Phases)
-                                println("Intruded sills before eruption: $(round(sills_before, digits=1)) m, after: $(round(sills_after, digits=1)) m (erupted thickness: $(round(h_erupt, digits=1)) m)")
-                                println("  enthalpy drift ($(erupt_mode)): ΔH = $(round((H_after-H_before)/1e9, digits=3)) GJ/m² ($(round(100*(H_after-H_before)/H_before, digits=3))% of column)")
-                                Params.Told .= T
-                                # ϕ was computed from the pre-eruption T during this step's
-                                # nonlinear solve and isn't otherwise refreshed until next
-                                # timestep - recompute it now so the melt-fraction plot and the
-                                # eruptibility check both see the post-eruption state immediately
-                                compute_meltfraction!(Params.ϕ, MatParam, Params.Phases, (T = Params.Told .+ 273.15,))
-                                if track_discrete_tracers
-                                    erupted = extract_erupted_tracers!(tracers, Erupt_z0, h_erupt)
-                                    append!(erupted_tracers, erupted)
-                                    # remaining tracers ride the host rock through the closure
-                                    collapse_tracers!(tracers, Erupt_z0, h_erupt; method=erupt_mode)
-                                end
-                            end
-                            event_volume = A_sill*h_erupt / 1e9   # m^3 -> km^3
+                            sills_before = integrated_content(rocks, z)
+                            aggregated = dh_mode && erupt_state.h_pending > h_requested + 64eps(max(h_erupt, 1.0))
+                            T, rocks, erupted, event = realize_eruption!(rng, T, rocks,
+                                tracers, Params.ϕ, z, MatParam, Params.Phases;
+                                realization_time=time,
+                                trigger_time=dh_mode ? erupt_state.pending_since : time,
+                                h_requested=h_erupt, h_booked=h_erupt, z_lo, z_hi,
+                                trigger=trigger_method, closure=erupt_mode, aggregated,
+                                eligible_phase=nothing)
+                            append!(erupted_tracers, erupted)
+                            push!(eruption_events, event)
+                            erupted_step += event.erupted_enthalpy
+                            magma_out_step += event.magma_removed
+                            melt_out_step += max(0.0, event.melt_removed)
+                            sills_after = integrated_content(rocks, z)
+                            println("Intruded sills before eruption: $(round(sills_before, digits=1)) m, after: $(round(sills_after, digits=1)) m (erupted thickness: $(round(h_erupt, digits=1)) m)")
+                            println("  event enthalpy residual ($(erupt_mode)): $(round(event.enthalpy_residual/1e9, digits=3)) GJ/m²")
+                            Params.Told .= T
+                            # ϕ was computed from the pre-eruption T during this step's
+                            # nonlinear solve and isn't otherwise refreshed until next
+                            # timestep - recompute it now so the melt-fraction plot and the
+                            # eruptibility check both see the post-eruption state immediately
+                            compute_meltfraction!(Params.ϕ, MatParam, Params.Phases, (T = Params.Told .+ 273.15,))
+                            # remaining tracers ride the host rock through the closure
+                            collapse_tracers!(tracers, Erupt_z0, h_erupt; method=erupt_mode)
+                            dh_mode && commit_pending_withdrawal!(erupt_state, event.state_withdrawn)
+                            event_volume = A_sill*event.booked / 1e9   # m^3 -> km^3
                             erupted_volume += event_volume
                             push!(eruption_event_time_vec, time_kyrs)
                             push!(eruption_event_volume_vec, event_volume)
+                            push!(collapse_event_time_vec, time_kyrs)
+                            push!(collapse_event_thickness_vec, event.state_withdrawn)
+                            surface_subsidence += collapse_surface_subsidence(erupt_mode, event.state_withdrawn)
                             box_mode && (P_over = 0.0)   # chamber relaxed to lithostatic
                             # D&H: ΔP already reset inside step_overpressure! on each drain
-                            subgrid = resolvable ? "" : " [sub-grid: volume counted, no column collapse]"
-                            println("Eruption (discrete) @ z=$Erupt_z0, erupted thickness=$(round(h_erupt, digits=2)) m, volume=$(round(event_volume, digits=4)) km^3, cumulative=$(round(erupted_volume, digits=4)) km^3$subgrid")
+                            println("Eruption (discrete) @ z=$Erupt_z0, erupted thickness=$(round(event.booked, digits=2)) m, volume=$(round(event_volume, digits=4)) km^3, cumulative=$(round(erupted_volume, digits=4)) km^3")
                         end
                     end
                 end
@@ -640,7 +922,7 @@ function sill_intrusion_1D(; size=nothing)
                         thickness = z_hi - z_lo
                         # the steady Q_magma recharge pressurizes the chamber continuously
                         if box_mode
-                            P_over_Q += (ȧ*Params_Q.Δt)/(max(thickness, Sillthick)*β_eff)
+                            P_over_Q += Δh/(max(thickness, Sillthick)*β_eff)
                         end
                         zc_dh = 0.0
                         if dh_mode
@@ -654,50 +936,89 @@ function sill_intrusion_1D(; size=nothing)
                                 iw_lo = max(1, minimum(ind_e)-1); iw_hi = min(length(T_Q), maximum(ind_e)+1)
                                 T_wall_K = 0.5*(T_Q[iw_lo] + T_Q[iw_hi]) + 273.15
                                 erupt_params.η_r = wall_relaxation_viscosity(erupt_params, T_wall_K)
-                                step_overpressure!(erupt_state_Q, erupt_params, T_mush_K, ϕ_mush, V_e, ȧ, Params_Q.Δt; z_centroid=zc_dh)
+                                step_overpressure!(erupt_state_Q, erupt_params, T_mush_K, ϕ_mush, V_e, ȧ_step, Params_Q.Δt; z_centroid=zc_dh)
                             end
                         end
                         near_boundary = (z_lo - margin <= z[1]) || (z_hi + margin >= z[end])
                         h_melt  = melt_thickness(Params_Q.ϕ, z, z_lo, z_hi)
+                        h_requested = dh_mode ? erupt_state_Q.h_erupt : 0.0
+                        if h_requested > 0
+                            push!(eruption_trigger_time_Q_vec, time_kyrs)
+                            push!(eruption_trigger_volume_Q_vec, A_sill*h_requested/1e9)
+                        end
                         h_erupt = box_mode ? min(β_eff*thickness*P_over_Q, h_melt) :
-                                  dh_mode  ? min(erupt_state_Q.h_erupt, h_melt) : h_melt
-                        trigger = box_mode ? (P_over_Q >= ΔPc) :
-                                  dh_mode  ? (erupt_state_Q.h_erupt > 0) :
-                                             (thickness >= Eruption_thick)
-                        depth_ok   = abs((z_lo + z_hi)/2) <= z_erupt_max
-                        resolvable = h_erupt > 2*Δz
-                        fires = trigger && depth_ok && !near_boundary && h_erupt > 0 &&
-                                (dh_mode || resolvable)
+                                  dh_mode  ? pending_withdrawal!(erupt_state_Q, h_requested, h_melt, Δz; time) : h_melt
+                        fires = eruption_fires(trigger_method; thickness, threshold=Eruption_thick,
+                            overpressure=P_over_Q, pressure_critical=ΔPc, h_erupt, z_lo, z_hi,
+                            z_erupt_max, near_boundary, Δz)
                         if fires
                             Erupt_z0 = (z_lo + z_hi)/2
-                            if resolvable
-                                T_Q, _ = erupt_melt!(T_Q, zero(T_Q), z; Erupt_z0=Erupt_z0, Erupt_thick=h_erupt, method=erupt_mode)
-                                Params_Q.Told .= T_Q
-                                compute_meltfraction!(Params_Q.ϕ, MatParam, Params_Q.Phases, (T = Params_Q.Told .+ 273.15,))
-                                # the injection-zone boundary markers (dashed lines in ax2)
-                                # ride on the host rock through the closure
-                                collapse_markers!(zone_markers, Erupt_z0, h_erupt; method=erupt_mode)
-                                if !track_discrete_tracers
-                                    erupted = extract_erupted_tracers!(tracers, Erupt_z0, h_erupt)
-                                    append!(erupted_tracers, erupted)
-                                    # remaining tracers ride the host rock through the closure
-                                    collapse_tracers!(tracers, Erupt_z0, h_erupt; method=erupt_mode)
-                                end
-                            end
-                            event_volume = A_sill*h_erupt / 1e9   # m^3 -> km^3
+                            aggregated = dh_mode && erupt_state_Q.h_pending > h_requested + 64eps(max(h_erupt, 1.0))
+                            T_Q, rocks_Q, erupted, event = realize_eruption!(rng, T_Q, rocks_Q,
+                                tracers_Q, Params_Q.ϕ, z, MatParam, Params_Q.Phases;
+                                realization_time=time,
+                                trigger_time=dh_mode ? erupt_state_Q.pending_since : time,
+                                h_requested=h_erupt, h_booked=h_erupt, z_lo, z_hi,
+                                trigger=trigger_method, closure=erupt_mode, aggregated,
+                                eligible_phase=nothing)
+                            append!(erupted_tracers_Q, erupted)
+                            push!(eruption_events_Q, event)
+                            erupted_step_Q += event.erupted_enthalpy
+                            magma_out_step_Q += event.magma_removed
+                            melt_out_step_Q += max(0.0, event.melt_removed)
+                            Params_Q.Told .= T_Q
+                            compute_meltfraction!(Params_Q.ϕ, MatParam, Params_Q.Phases, (T = Params_Q.Told .+ 273.15,))
+                            # the injection-zone boundary markers (dashed lines in ax2)
+                            # ride on the host rock through the closure
+                            collapse_markers!(zone_markers, Erupt_z0, h_erupt; method=erupt_mode)
+                            # remaining tracers ride the host rock through the closure
+                            collapse_tracers!(tracers_Q, Erupt_z0, h_erupt; method=erupt_mode)
+                            dh_mode && commit_pending_withdrawal!(erupt_state_Q, event.state_withdrawn)
+                            event_volume = A_sill*event.booked / 1e9   # m^3 -> km^3
                             erupted_volume_Q += event_volume
                             push!(eruption_event_time_Q_vec, time_kyrs)
                             push!(eruption_event_volume_Q_vec, event_volume)
+                            push!(collapse_event_time_Q_vec, time_kyrs)
+                            push!(collapse_event_thickness_Q_vec, event.state_withdrawn)
+                            surface_subsidence_Q += collapse_surface_subsidence(erupt_mode, event.state_withdrawn)
                             box_mode && (P_over_Q = 0.0)   # chamber relaxed to lithostatic
                             # D&H: ΔP already reset inside step_overpressure! on each drain
-                            subgrid = resolvable ? "" : " [sub-grid: volume counted, no column collapse]"
-                            println("Eruption (Q_magma) @ z=$Erupt_z0, erupted thickness=$(round(h_erupt, digits=2)) m, volume=$(round(event_volume, digits=4)) km^3, cumulative=$(round(erupted_volume_Q, digits=4)) km^3$subgrid")
+                            println("Eruption (Q_magma) @ z=$Erupt_z0, erupted thickness=$(round(event.booked, digits=2)) m, volume=$(round(event_volume, digits=4)) km^3, cumulative=$(round(erupted_volume_Q, digits=4)) km^3")
                         end
                     end
                 end
             end
+            if run_discrete
+                update_enthalpy_budget!(enthalpy_budget,
+                    column_enthalpy(T, z, MatParam, Params.Phases);
+                    boundary=boundary_step, injected=injected_step,
+                    source=source_step, erupted=erupted_step)
+                push!(enthalpy_budget_vec, enthalpy_budget_snapshot(enthalpy_budget))
+                # ϕ is left over from the solve, which ran on the pre-injection T; the
+                # budgets and the plots below need the melt fraction of the state the step
+                # actually ends in
+                compute_meltfraction!(Params.ϕ, MatParam, Params.Phases, (T = Params.Told .+ 273.15,))
+                update_mass_budget!(mass_budget, integrated_content(rocks, z),
+                    melt_thickness(Params.ϕ, z, z[1], z[end]);
+                    injected=magma_in_step, withdrawn=magma_out_step, erupted=melt_out_step)
+                push!(mass_budget_vec, mass_budget_snapshot(mass_budget))
+            end
+            if run_Qmagma
+                update_enthalpy_budget!(enthalpy_budget_Q,
+                    column_enthalpy(T_Q, z, MatParam, Params_Q.Phases);
+                    boundary=boundary_step_Q, injected=injected_step_Q,
+                    source=source_step_Q, erupted=erupted_step_Q)
+                push!(enthalpy_budget_Q_vec, enthalpy_budget_snapshot(enthalpy_budget_Q))
+                compute_meltfraction!(Params_Q.ϕ, MatParam, Params_Q.Phases, (T = Params_Q.Told .+ 273.15,))
+                update_mass_budget!(mass_budget_Q, integrated_content(rocks_Q, z),
+                    melt_thickness(Params_Q.ϕ, z, z[1], z[end]);
+                    injected=magma_in_step_Q, withdrawn=magma_out_step_Q, erupted=melt_out_step_Q)
+                push!(mass_budget_Q_vec, mass_budget_snapshot(mass_budget_Q))
+            end
             push!(erupted_volume_vec, erupted_volume)
             push!(erupted_volume_Q_vec, erupted_volume_Q)
+            push!(surface_subsidence_vec, surface_subsidence)
+            push!(surface_subsidence_Q_vec, surface_subsidence_Q)
 
             push!(time_vec, time_kyrs)
             if run_discrete
@@ -735,7 +1056,7 @@ function sill_intrusion_1D(; size=nothing)
                     Tplot[] = T
                     ϕplot[] = Params.ϕ
                     rock_low  = Point2f.(zero(rocks), z/1e3)
-                    rock_high = Point2f.(rocks, z/1e3)
+                    rock_high = Point2f.(clamp.(rocks, 0.0, 1.0), z/1e3)
                     band!(ax2, rock_low, rock_high, color=(:lightgrey,1.0), label="injected sills")
                     lines!(ax2, Params.ϕ, z/1e3, color=:blue, label="discrete sills ϕ")
                 end
@@ -842,10 +1163,21 @@ function sill_intrusion_1D(; size=nothing)
 
         empty!(last_run)
         last_run[:z] = z
+        last_run[:T_background] = T_background
+        last_run[:gaussian_sigma] = R_sill
         last_run[:time_vec] = time_vec
+        last_run[:flux_m_per_yr] = flux_vec
+        last_run[:flux_mode] = ȧ.mode
+        last_run[:flux_base_m_per_yr] = ȧ.base*SecYear
+        last_run[:flux_peak_m_per_yr] = ȧ.peak*SecYear
+        last_run[:flux_start_kyr] = ȧ.t_start/SecYear/1e3
+        last_run[:flux_end_kyr] = ȧ.t_end/SecYear/1e3
+        last_run[:flux_table_time_kyr] = ȧ.times./SecYear./1e3
+        last_run[:flux_table_m_per_yr] = ȧ.rates.*SecYear
         if run_discrete
             last_run[:T] = T
             last_run[:phi] = Params.ϕ
+            last_run[:rocks] = rocks
             last_run[:Tmax_vec] = Tmax_vec
             last_run[:phimax_vec] = ϕmax_vec
         end
@@ -855,10 +1187,32 @@ function sill_intrusion_1D(; size=nothing)
             last_run[:Tmax_vec_Qmagma] = TQmax_vec
             last_run[:phimax_vec_Qmagma] = ϕQmax_vec
             last_run[:erupted_volume_vec_Qmagma] = erupted_volume_Q_vec
+            last_run[:eruption_event_time_vec_Qmagma] = eruption_event_time_Q_vec
+            last_run[:eruption_event_volume_vec_Qmagma] = eruption_event_volume_Q_vec
+            last_run[:collapse_event_time_vec_Qmagma] = collapse_event_time_Q_vec
+            last_run[:collapse_event_thickness_vec_Qmagma] = collapse_event_thickness_Q_vec
+            last_run[:surface_subsidence_vec_Qmagma] = surface_subsidence_Q_vec
+            last_run[:zone_markers_Qmagma] = copy(zone_markers)
+            last_run[:tracers_Qmagma] = tracers_Q
+            last_run[:erupted_tracers_Qmagma] = erupted_tracers_Q
+            last_run[:eruption_events_Qmagma] = eruption_events_Q
+            last_run[:enthalpy_budget_Qmagma] = enthalpy_budget_Q_vec
+            last_run[:mass_budget_Qmagma] = mass_budget_Q_vec
+            last_run[:rocks_Qmagma] = rocks_Q
         end
-        last_run[:tracers] = tracers
-        last_run[:erupted_tracers] = erupted_tracers
+        # Generic keys retain their historical meaning: the discrete branch is primary
+        # in comparison runs, otherwise they point to the sole Q_magma branch.
+        last_run[:tracers] = run_discrete ? tracers : tracers_Q
+        last_run[:erupted_tracers] = run_discrete ? erupted_tracers : erupted_tracers_Q
+        last_run[:eruption_events] = run_discrete ? eruption_events : eruption_events_Q
+        last_run[:enthalpy_budget] = run_discrete ? enthalpy_budget_vec : enthalpy_budget_Q_vec
+        last_run[:mass_budget] = run_discrete ? mass_budget_vec : mass_budget_Q_vec
         last_run[:erupted_volume_vec] = erupted_volume_vec
+        last_run[:eruption_event_time_vec] = eruption_event_time_vec
+        last_run[:eruption_event_volume_vec] = eruption_event_volume_vec
+        last_run[:collapse_event_time_vec] = collapse_event_time_vec
+        last_run[:collapse_event_thickness_vec] = collapse_event_thickness_vec
+        last_run[:surface_subsidence_vec] = surface_subsidence_vec
 
         # D&H chamber H₂O-evolution history vs time_vec (stepping stone for the inversion):
         # overpressure, dissolved/exsolved H₂O mass fractions, gas volume fraction & density,
@@ -871,6 +1225,9 @@ function sill_intrusion_1D(; size=nothing)
             last_run[:chamber_rhogas_vec] = rhogas_vec
             last_run[:chamber_etar_vec]   = etar_vec
             last_run[:chamber_phimush_vec] = phimush_vec
+            last_run[:eruption_trigger_time_vec] = eruption_trigger_time_vec
+            last_run[:eruption_trigger_volume_vec] = eruption_trigger_volume_vec
+            last_run[:pending_withdrawal] = erupt_state.h_pending
         end
         if trigger_method == "D&H 3-phase" && run_Qmagma
             last_run[:chamber_dP_vec_Qmagma]     = dP_Q_vec
@@ -880,12 +1237,17 @@ function sill_intrusion_1D(; size=nothing)
             last_run[:chamber_rhogas_vec_Qmagma] = rhogas_Q_vec
             last_run[:chamber_etar_vec_Qmagma]   = etar_Q_vec
             last_run[:chamber_phimush_vec_Qmagma] = phimush_Q_vec
+            last_run[:eruption_trigger_time_vec_Qmagma] = eruption_trigger_time_Q_vec
+            last_run[:eruption_trigger_volume_vec_Qmagma] = eruption_trigger_volume_Q_vec
+            last_run[:pending_withdrawal_Qmagma] = erupt_state_Q.h_pending
         end
 
-        global tracers_out = tracers
-        global erupted_tracers_out = erupted_tracers
+        # Preserve the existing REPL aliases: discrete is primary in comparison runs.
+        global tracers_out = run_discrete ? tracers : tracers_Q
+        global erupted_tracers_out = run_discrete ? erupted_tracers : erupted_tracers_Q
         global last_run_out = copy(last_run)
-        println("Simulation data available in the REPL: `QMagma.tracers_out` (tracer T-t histories), `QMagma.erupted_tracers_out` (tracers removed by eruption), `QMagma.last_run_out` (1D profiles z/T/phi vs depth, Tmax/phimax vs time, erupted_volume_vec, and — for a D&H run — chamber_{dP,mdiss,Xg,phig,rhogas,etar,phimush}_vec H₂O-evolution history vs time_vec). SAVE DATA writes it all to <filename>.jld2.")
+        println("Simulation data available in the REPL: `QMagma.tracers_out` (tracer T-t histories), `QMagma.erupted_tracers_out` (tracers removed by eruption), `QMagma.last_run_out` (profiles, time series, unified eruption_events, cumulative enthalpy_budget, and — for a D&H run — chamber H₂O diagnostics). SAVE DATA writes it all to <filename>.jld2.")
+        println("SAVE JLD2 + VTK also writes Gaussian 2D/3D temperature VTKs for each active model, with σ equal to the sill radius and lateral extent ±3σ.")
         println("Compute zircon ages with: `QMagma.compute_zircon_ages(QMagma.tracers_out)`, or click COMPUTE ZIRCON AGES")
         catch err
             @error "Simulation loop failed" exception=(err, catch_backtrace())

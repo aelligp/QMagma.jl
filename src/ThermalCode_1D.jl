@@ -1,26 +1,122 @@
 using GeoParams
-using ForwardDiff, SparseArrays, SparseDiffTools, LinearAlgebra, Interpolations
+using ForwardDiff, SparseArrays, SparseDiffTools, LinearAlgebra, Interpolations, Random
 using ZirconGrowth
+
+const SecYear = 3600 * 24 * 365.25
 
 av(x) = (x[2:end]+x[1:end-1])/2
 
+"""
+    grid_cell_edges(z)
+
+Control-volume edges for a node-centered, strictly ascending grid. The physical domain
+is `[z[1], z[end]]`; boundary nodes therefore own half cells on a uniform grid.
+"""
+function grid_cell_edges(z)
+    length(z) >= 2 || throw(ArgumentError("z must contain at least two points"))
+    zv = collect(float.(z))
+    all(isfinite, zv) || throw(ArgumentError("z must be finite"))
+    all(>(0), diff(zv)) || throw(ArgumentError("z must be strictly ascending"))
+    edges = similar(zv, length(zv) + 1)
+    edges[1] = zv[1]
+    edges[2:end-1] .= av(zv)
+    edges[end] = zv[end]
+    return edges
+end
+
+function interval_cell_widths(z, z_lo=first(z), z_hi=last(z))
+    edges = grid_cell_edges(z)
+    first(z) <= z_lo <= z_hi <= last(z) || throw(ArgumentError(
+        "integration interval [$z_lo, $z_hi] must lie inside [$(first(z)), $(last(z))]"))
+    return [max(0.0, min(edges[i + 1], z_hi) - max(edges[i], z_lo))
+            for i in eachindex(z)]
+end
 
 """
-    init_model(;nz=101, L=40e3, Geotherm=0, Ttop=400.0, Tbot=0.0, Δt=1e3*SecYear, MatParam=nothing)
+    integrated_content(field, z[, z_lo, z_hi])
 
-Create initial model setup
+Integrate a node-centered control-volume field over the physical grid domain or a
+clipped depth interval. This gives boundary nodes half-cell weight on a uniform grid,
+so a constant field integrates to `z_hi - z_lo` rather than one extra grid spacing.
 """
-function init_model(;nz=101, L=40e3, Geotherm=0, Ttop=400.0, Tbot=0.0, Δt=1e3*SecYear, MatParam=nothing)
+function integrated_content(field, z, z_lo=first(z), z_hi=last(z))
+    length(field) == length(z) ||
+        throw(DimensionMismatch("field and z must have equal length"))
+    all(isfinite, field) || throw(ArgumentError("field must be finite"))
+    isfinite(z_lo) && isfinite(z_hi) ||
+        throw(ArgumentError("integration bounds must be finite"))
+    widths = interval_cell_widths(z, z_lo, z_hi)
+    total = zero(promote_type(eltype(field), eltype(widths)))
+    for i in eachindex(field)
+        widths[i] > 0 && (total += field[i] * widths[i])
+    end
+    return total
+end
+
+"""
+    add_uniform_content!(field, z, z_lo, z_hi, amount)
+
+Add an exactly integrated `amount` to `field`, uniformly over `[z_lo, z_hi]`, using
+the same control volumes as [`integrated_content`](@ref).
+"""
+function add_uniform_content!(field, z, z_lo, z_hi, amount)
+    length(field) == length(z) ||
+        throw(DimensionMismatch("field and z must have equal length"))
+    all(isfinite, (z_lo, z_hi, amount)) ||
+        throw(ArgumentError("bounds and amount must be finite"))
+    first(z) <= z_lo < z_hi <= last(z) || throw(ArgumentError(
+        "addition interval [$z_lo, $z_hi] must lie inside [$(first(z)), $(last(z))]"))
+    amount >= 0 || throw(ArgumentError("amount must be nonnegative"))
+    edges = grid_cell_edges(z)
+    concentration = amount / (z_hi - z_lo)
+    for i in eachindex(field)
+        overlap = min(edges[i + 1], z_hi) - max(edges[i], z_lo)
+        overlap > 0 && (field[i] += concentration * overlap / (edges[i + 1] - edges[i]))
+    end
+    return field
+end
+
+function nonnegative_debit(before, after, label)
+    debit = before - after
+    tolerance = 128eps(max(abs(before), abs(after), 1.0))
+    debit >= 0 && return debit
+    debit >= -tolerance && return 0.0
+    throw(ArgumentError("$label increased by $(-debit) during an outflow-only remap"))
+end
+
+
+"""
+    init_model(; nz=101, L=40e3, Geotherm=0, Ttop=400.0, Tbot=0.0,
+               Δt=1e3*SecYear, MatParam=nothing, ρ=nothing, Q_L=nothing,
+               Conductivity=nothing, HeatCapacity=nothing, Melting=nothing)
+
+Create initial model setup.
+
+The material parameters are assembled here from the individual constitutive laws, so every
+entry point (GUI, scripts, tests) shares one definition of the host-rock properties. `ρ`
+[kg/m³] is the host-rock *thermal* density, the one that enters heat storage and
+conduction; it is a separate role from the melt, crystal and lithostatic densities on
+[`EruptionParams`](@ref), which [`check_density_consistency`](@ref) keeps in step. Pass a
+ready-made `MatParam` tuple only to reuse one built elsewhere; combining it with any
+component keyword is an error because those components would otherwise be ignored.
+"""
+function init_model(;nz=101, L=40e3, Geotherm=0, Ttop=400.0, Tbot=0.0, Δt=1e3*SecYear, MatParam=nothing,
+                    ρ=nothing, Q_L=nothing, Conductivity=nothing,
+                    HeatCapacity=nothing, Melting=nothing)
     if isnothing(MatParam)
-        MatParam     = (SetMaterialParams(Name="RockMelt", Phase=0,
-                            Density         = ConstantDensity(ρ=2700kg/m^3),                            # used in the parameterisation of Whittington
-                            LatentHeat      = ConstantLatentHeat(Q_L=2.55e5J/kg),
+        ρ = something(ρ, 2700.0)
+        Q_L = something(Q_L, 2.55e5)
+        Conductivity = something(Conductivity, T_Conductivity_Whittington())
+        HeatCapacity = something(HeatCapacity, T_HeatCapacity_Whittington())
+        Melting = something(Melting, MeltingParam_Assimilation())
+        MatParam     = (SetMaterialParams(; Name="RockMelt", Phase=0,
+                            Density         = ConstantDensity(; ρ=ρ*kg/m^3),
+                            LatentHeat      = ConstantLatentHeat(Q_L=Q_L*J/kg),
                             RadioactiveHeat = ExpDepthDependentRadioactiveHeat(H_0=0e-7Watt/m^3),
-                            Conductivity    = T_Conductivity_Whittington(),                             #  T-dependent k
-                            HeatCapacity    = T_HeatCapacity_Whittington(),                             # T-dependent cp
-                            Melting         = MeltingParam_Assimilation()                               # Quadratic parameterization as in Tierney et al.
-                            ),
+                            Conductivity, HeatCapacity, Melting),
                     )
+    elseif any(x -> !isnothing(x), (ρ, Q_L, Conductivity, HeatCapacity, Melting))
+        throw(ArgumentError("MatParam cannot be combined with component material keywords"))
     end
 
     # Numerics
@@ -37,6 +133,7 @@ function init_model(;nz=101, L=40e3, Geotherm=0, Ttop=400.0, Tbot=0.0, Δt=1e3*S
     dz          =   L/(nz-1)
     z           =   -L:dz:0
     T           =   -Geotherm/1e3.*Vector(z) .+ Ttop
+    Told        =   -Geotherm/1e3.*Vector(z) .+ Ttop
 
     Phases      =   fill(0,nz)
     Phases_c    =   fill(0,nz-1)
@@ -93,8 +190,13 @@ function Res!(F::AbstractVector{_T}, T::AbstractVector{_T}, Δ::NTuple, N::NTupl
 
     return F
 end
-Res_closed! = (F,T) -> Res!(F, T, Δ, N, BC, Params, MatParam)
 
+"""
+    LineSearch(func::Function, F, x, δx; α=[0.01 0.05 0.1 0.25 0.5 0.75 1.0])
+
+Pick the step size out of `α` that minimizes the residual norm of `func` at `x + α*δx`,
+and return it together with that norm.
+"""
 function LineSearch(func::Function, F, x, δx;  α = [0.01 0.05 0.1 0.25 0.5 0.75 1.0])
     Fnorm = zero(α)
     N     = length(x)
@@ -141,6 +243,182 @@ function nonlinear_solution(Fup::Vector, T::Vector, J, colors; tol=1e-8, maxit=1
 end
 
 """
+    FluxHistory(mode; base, peak=base, t_start=0, t_end=0, times=[], rates=[])
+
+Validated magma-accretion history in internal units (seconds and m/s). Supported modes:
+`:constant`, `:ramp` (linear from `base` to `peak`), `:pulse` (`peak` between
+`t_start` and `t_end`, `base` otherwise), and `:table` (piecewise-linear `times`,`rates`
+with flat extrapolation).
+"""
+struct FluxHistory
+    mode    :: Symbol
+    base    :: Float64
+    peak    :: Float64
+    t_start :: Float64
+    t_end   :: Float64
+    times   :: Vector{Float64}
+    rates   :: Vector{Float64}
+end
+
+function FluxHistory(mode; base=0.0, peak=base, t_start=0.0, t_end=0.0,
+                     times=Float64[], rates=Float64[])
+    mode in (:constant, :ramp, :pulse, :table) ||
+        throw(ArgumentError("flux mode must be :constant, :ramp, :pulse, or :table"))
+    base, peak, t_start, t_end = Float64.((base, peak, t_start, t_end))
+    times, rates = Float64.(times), Float64.(rates)
+    all(isfinite, (base, peak, t_start, t_end)) && all(isfinite, times) && all(isfinite, rates) ||
+        throw(ArgumentError("flux-history values must be finite"))
+    base >= 0 && peak >= 0 && all(>=(0), rates) ||
+        throw(ArgumentError("flux rates must be nonnegative"))
+    if mode in (:ramp, :pulse)
+        0 <= t_start < t_end ||
+            throw(ArgumentError("ramp/pulse times must satisfy 0 ≤ t_start < t_end"))
+    elseif mode == :table
+        length(times) == length(rates) ||
+            throw(DimensionMismatch("table times and rates must have equal length"))
+        length(times) >= 2 || throw(ArgumentError("flux table must contain at least two rows"))
+        all(>(0), diff(times)) || throw(ArgumentError("flux-table times must be strictly increasing"))
+    end
+    return FluxHistory(mode, base, peak, t_start, t_end, times, rates)
+end
+
+function (history::FluxHistory)(time)
+    isfinite(time) || throw(ArgumentError("time must be finite"))
+    if history.mode == :constant
+        return history.base
+    elseif history.mode == :ramp
+        time <= history.t_start && return history.base
+        time >= history.t_end && return history.peak
+        f = (time - history.t_start) / (history.t_end - history.t_start)
+        return history.base + f*(history.peak - history.base)
+    elseif history.mode == :pulse
+        return history.t_start <= time < history.t_end ? history.peak : history.base
+    end
+    time <= history.times[1] && return history.rates[1]
+    time >= history.times[end] && return history.rates[end]
+    i = searchsortedlast(history.times, time)
+    f = (time - history.times[i]) / (history.times[i + 1] - history.times[i])
+    return history.rates[i] + f*(history.rates[i + 1] - history.rates[i])
+end
+
+"""
+    load_flux_history(path; time_scale=1000SecYear, rate_scale=1/SecYear)
+
+Read a two-column text/CSV table (`time_kyr, flux_m_per_yr` by default) and return a
+piecewise-linear [`FluxHistory`](@ref). One header row plus blank and `#` comment lines are
+accepted; malformed data fail with the source line number.
+"""
+function load_flux_history(path; time_scale=1000SecYear, rate_scale=1/SecYear)
+    isfile(path) || throw(ArgumentError("flux table does not exist: $path"))
+    all(isfinite, (time_scale, rate_scale)) && time_scale > 0 && rate_scale > 0 ||
+        throw(ArgumentError("table unit scales must be finite and positive"))
+    times, rates = Float64[], Float64[]
+    header_skipped = false
+    for (line_number, raw) in enumerate(eachline(path))
+        line = strip(raw)
+        (isempty(line) || startswith(line, '#')) && continue
+        fields = split(replace(line, ',' => ' '))
+        if length(fields) != 2
+            throw(ArgumentError("flux table line $line_number must contain exactly two columns"))
+        end
+        time = tryparse(Float64, fields[1])
+        rate = tryparse(Float64, fields[2])
+        if time === nothing || rate === nothing
+            if isempty(times) && !header_skipped
+                header_skipped = true
+                continue
+            end
+            throw(ArgumentError("flux table line $line_number contains nonnumeric data"))
+        end
+        push!(times, time*time_scale)
+        push!(rates, rate*rate_scale)
+    end
+    return FluxHistory(:table; times, rates)
+end
+
+function _integrate_linear_flux(history::FluxHistory, time, Δt, breakpoints)
+    stop = time + Δt
+    interior = [t for t in breakpoints if time < t < stop]
+    points = vcat(time, interior, stop)
+    return sum((history(points[i]) + history(points[i + 1])) *
+               (points[i + 1] - points[i]) / 2 for i in 1:length(points)-1)
+end
+
+function injected_thickness(history::FluxHistory, time, Δt)
+    Δt > 0 || throw(ArgumentError("Δt must be positive"))
+    isfinite(time) || throw(ArgumentError("time must be finite"))
+    if history.mode == :constant
+        return history.base*Δt
+    elseif history.mode == :pulse
+        overlap = max(0.0, min(time + Δt, history.t_end) - max(time, history.t_start))
+        return history.base*Δt + (history.peak - history.base)*overlap
+    elseif history.mode == :ramp
+        return _integrate_linear_flux(history, time, Δt, (history.t_start, history.t_end))
+    end
+    return _integrate_linear_flux(history, time, Δt, history.times)
+end
+
+"""
+    injected_thickness(ȧ, time, Δt) -> Δh
+
+Magma thickness [m] accreted during the step `(time, time + Δt]` for the accretion-rate
+history `ȧ` [m/s], integrated by the midpoint rule (exact for a constant rate). `ȧ` is
+either a number or a callable `ȧ(t)`.
+
+This is the single forcing quantity both emplacement branches derive from: the discrete
+branch counts sills per accumulated thickness ([`sills_due`](@ref)) and the smeared branch
+uses the step-mean rate `Δh/Δt` ([`compute_Q_magma!`](@ref)), so the two cannot drift apart
+under a variable rate.
+"""
+function injected_thickness(ȧ, time, Δt)
+    Δt > 0 || throw(ArgumentError("Δt must be positive"))
+    isfinite(time) || throw(ArgumentError("time must be finite"))
+    rate = ȧ isa Number ? ȧ : ȧ(time + Δt/2)
+    isfinite(rate) && rate >= 0 ||
+        throw(ArgumentError("accretion rate must be finite and nonnegative, got $rate"))
+    return rate*Δt
+end
+
+"""
+    sills_due(A, ΔA, d) -> Int
+
+Number of sills of aperture `d` [m] completed while the cumulative injected thickness grows
+from `A` to `A + ΔA`, i.e. `floor((A+ΔA)/d) - floor(A/d)`. More than one sill is returned
+when a step delivers more than one aperture, and none while the accretion rate is zero.
+
+Emplacement is keyed to injected thickness rather than to elapsed time so that a varying
+accretion rate changes the event *frequency* at fixed aperture. For a constant rate
+`ȧ = d/interval` this reproduces the event times of an interval-keyed schedule.
+"""
+function sills_due(A, ΔA, d)
+    all(isfinite, (A, ΔA, d)) || throw(ArgumentError("A, ΔA, and d must be finite"))
+    A >= 0 || throw(ArgumentError("A must be nonnegative"))
+    ΔA >= 0 || throw(ArgumentError("ΔA must be nonnegative"))
+    d > 0 || throw(ArgumentError("sill aperture must be positive"))
+
+    sill_index(a) = floor(Int, a / d + 8eps(a / d))
+    return sill_index(A + ΔA) - sill_index(A)
+end
+
+"""
+    mean_sill_velocity(z, ȧ, zbot, ztop; r=5e3)
+
+Time-averaged host-rock velocity generated by sills whose centers are uniformly
+distributed between `zbot` and `ztop`. Each sill has full aperture `d`, so each wall
+moves by `d/2`; multiplying by the event rate `ȧ/d` eliminates `d` from the mean.
+The elastic decay is the same as [`crack_perp_displacement`](@ref).
+"""
+function mean_sill_velocity(z, ȧ, zbot, ztop; r=5e3)
+    ȧ >= 0 || throw(ArgumentError("ȧ must be nonnegative"))
+    ztop > zbot || throw(ArgumentError("ztop must be greater than zbot"))
+    r > 0 || throw(ArgumentError("r must be positive"))
+
+    H = ztop - zbot
+    primitive(x) = abs(x) - sqrt(r^2 + x^2) + r
+    return (ȧ / (2H)) .* (primitive.(z .- zbot) .- primitive.(z .- ztop))
+end
+
+"""
     compute_Q_magma!(Params, MatParam, z; Tsill, ȧ, Silltop, Sillbot)
 
 Smears repeated sill injection into a steady volumetric heat source `Params.Q` [W/m^3],
@@ -149,24 +427,33 @@ following
     Q_magma(z,t) = ρₘ ȧ/H [ cp(Tₘ - T(z,t)) + L(1-ϕ(T)) ]
 
 over the injection zone `z ∈ [-Sillbot, -Silltop]` (in m) of thickness `H = Sillbot-Silltop`,
-and zero elsewhere. `ȧ = Sillthick/Sill_interval` is the time-averaged accretion rate [m/s].
+and zero elsewhere. `ȧ` is the step-mean accretion rate [m/s] supplied by the shared
+flux history.
 The first term is the sensible heat magma surrenders cooling from `Tsill` to the local
 temperature; the second is the latent heat released crystallizing from ϕ=1 (injected liquid)
 down to the local melt fraction ϕ(T). ρ, cp and ϕ are (re-)evaluated here from `Params.Told`,
 consistent with how the rest of the residual is linearized.
 
-Also sets `Params.w`, the vertical advection velocity that mimics the host-rock
-displacement caused by discrete sill injection. Discrete sills use an elastic
-displacement profile (`crack_perp_displacement`, decay scale `r`) that decays away
-from the sill rather than persisting at constant amplitude far into the host rock; a
-spatially constant `w` outside the injection zone would over-advect heat into distal
-regions relative to discrete sills and bias Q_magma high. Here `w` is zero inside the
-injection zone, and outside it uses the same `crack_perp_displacement` decay law
-measured from the nearest zone edge: it peaks at `ȧ/2` right at the edge (matching the
-net accretion rate) and decays toward zero with the same length scale `r` used by
-discrete sill injection.
+ρₘ is the host-rock thermal density of `MatParam` at the local temperature, not the melt
+density `EruptionParams.ρ_melt`: the source therefore carries the enthalpy of a magma with
+the host rock's density, an approximation at the ~10% level of the injected heat.
+
+Also sets `Params.w` to the ensemble-mean host-rock velocity produced by discrete
+sills with uniformly distributed centers in the injection zone. This uses the same
+elastic displacement profile and full-aperture convention as [`insert_sill`](@ref),
+including the nonzero velocity within the zone away from its midpoint.
 """
 function compute_Q_magma!(Params, MatParam, z; Tsill, ȧ, Silltop, Sillbot, r=5e3)
+    all(isfinite, (Tsill, ȧ, Silltop, Sillbot, r)) ||
+        throw(ArgumentError("source parameters must be finite"))
+    ȧ >= 0 || throw(ArgumentError("ȧ must be nonnegative"))
+    Sillbot > Silltop || throw(ArgumentError("Sillbot must be greater than Silltop"))
+    r > 0 || throw(ArgumentError("r must be positive"))
+
+    zbot, ztop = -Sillbot*1e3, -Silltop*1e3
+    first(z) <= zbot < ztop <= last(z) || throw(ArgumentError(
+        "injection zone [$zbot, $ztop] m must lie inside [$(first(z)), $(last(z))] m"))
+
     args = (T = Params.Told .+ 273.15,)
     compute_heatcapacity!(Params.Cp, MatParam, Params.Phases, args)
     compute_density!(Params.ρ, MatParam, Params.Phases, args)
@@ -176,36 +463,51 @@ function compute_Q_magma!(Params, MatParam, z; Tsill, ȧ, Silltop, Sillbot, r=5e
     H   = (Sillbot - Silltop)*1e3
 
     Params.Q .= 0.0
-    ind = findall( z .>= -Sillbot*1e3 .&& z .<= -Silltop*1e3 )
+    ind = findall(zbot .<= z .<= ztop)
+    isempty(ind) && throw(ArgumentError("injection zone contains no grid points"))
     Params.Q[ind] .= Params.ρ[ind].*(ȧ/H).*( Params.Cp[ind].*(Tsill .- Params.Told[ind]) .+ Q_L.*(1.0 .- Params.ϕ[ind]) )
 
-    # host-rock advection: elastic-style decay away from the injection zone, matching
-    # the decay law used by discrete sill injection (crack_perp_displacement). Zero
-    # inside the zone; peaks at ȧ/2 at each edge and decays outward with scale r.
-    zbot, ztop  = -Sillbot*1e3, -Silltop*1e3
-    ind_below   = findall(z .< zbot)
-    ind_above   = findall(z .> ztop)
-    dist_below  = zbot .- z          # distance below the zone (positive below zbot)
-    dist_above  = z .- ztop          # distance above the zone (positive above ztop)
-
-    Params.w .= 0.0
-    Params.w[ind_below] .= -(ȧ/2).*(1.0 .- dist_below[ind_below]./sqrt.(r^2 .+ dist_below[ind_below].^2))
-    Params.w[ind_above] .=  (ȧ/2).*(1.0 .- dist_above[ind_above]./sqrt.(r^2 .+ dist_above[ind_above].^2))
+    Params.w .= mean_sill_velocity(z, ȧ, zbot, ztop; r)
 
     return Params.Q
 end
 
+"""
+    crack_perp_displacement(z, d; r=5e3)
+
+Wall displacement `d(1 - |z|/√(r²+z²))` of an elastic crack of radius `r` at
+perpendicular distance `z` from its plane: `d` at the crack face, decaying to zero far
+away. Used both to open a sill ([`insert_sill`](@ref)) and to close an erupted band
+([`collapse_displacement`](@ref)).
+"""
 crack_perp_displacement(z, d; r=5e3) = d.*(1.0 .- abs.(z)./(sqrt.(r^2 .+ z.^2)))
 
 """
-    Tadv = insert_sill!(T,z; Sill_thick=400, Sill_z0=-20e3, Sill_T=1200, SillType=:constant)
+    T_adv, rock_adv, h_out = insert_sill(T, rocks, z; Sill_thick=400, Sill_z0=-20e3, Sill_T=1200, SillType=:elastic)
 
-Adds a sill to the setup, using a 1D WENO5 advection scheme for a given temperature field `T` on a grid `z`.
-Optional parameters are the sill thickness `Sill_thick`, the sill center `Sill_z0`, the sill temperature `Sill_T`.
-Advection is done by `SillType`, which can be `:constant` (where rocks above/below are moved with constant displacement
-or `:elastic`, where the displacement decreases with distance from the sill.
+Adds a sill to the setup, advecting the temperature field `T` and the injected-magma
+indicator `rocks` on a grid `z` apart to make room for it, then control-volume mixing the
+sill interval at `Sill_T` and adding its `Sill_phase` content. Optional parameters are the sill thickness `Sill_thick`, the sill
+center `Sill_z0`, the sill temperature `Sill_T`. Advection is done by `SillType`, which can
+be `:constant` (where rocks above/below are moved with constant displacement) or `:elastic`,
+where the displacement decreases with distance from the sill.
+
+The third return value `h_out` is the injected-magma content [m] pushed out through a domain
+boundary by that displacement, the boundary term of the magma-volume budget
+([`MassBudget`](@ref)).
 """
 function insert_sill(T,rocks, z; Sill_thick=400, Sill_z0=-20e3, Sill_T=1200, Sill_phase=1.0, SillType=:elastic)
+    length(T) == length(rocks) == length(z) ||
+        throw(DimensionMismatch("T, rocks, and z must have equal length"))
+    all(isfinite, (Sill_thick, Sill_z0, Sill_T, Sill_phase)) ||
+        throw(ArgumentError("sill parameters must be finite"))
+    Sill_thick > 0 || throw(ArgumentError("Sill_thick must be positive"))
+    Sill_phase >= 0 || throw(ArgumentError("Sill_phase must be nonnegative"))
+    SillType in (:constant, :elastic) ||
+        throw(ArgumentError("SillType must be :constant or :elastic"))
+    z_lo, z_hi = Sill_z0 - Sill_thick/2, Sill_z0 + Sill_thick/2
+    first(z) <= z_lo < z_hi <= last(z) || throw(ArgumentError(
+        "sill interval [$z_lo, $z_hi] m must lie inside [$(first(z)), $(last(z))] m"))
 
     # find points above & below sill emplacement level
     z_shift = Vector(z) .-  Sill_z0;
@@ -217,31 +519,33 @@ function insert_sill(T,rocks, z; Sill_thick=400, Sill_z0=-20e3, Sill_T=1200, Sil
 
     # Assume constant displacement - in elastic case this should decrease with distance from sill
     if SillType==:constant
-        Displ[id_above]  .= Sill_thick
-        Displ[id_below]  .= -Sill_thick
+        Displ[id_above]  .= Sill_thick/2
+        Displ[id_below]  .= -Sill_thick/2
     elseif SillType==:elastic
         R = 5e3;
-        Displ[id_above]  .=  crack_perp_displacement(z_shift[id_above], Sill_thick; r=R)
-        Displ[id_below]  .= -crack_perp_displacement(z_shift[id_below], Sill_thick; r=R)
+        Displ[id_above]  .=  crack_perp_displacement(z_shift[id_above], Sill_thick/2; r=R)
+        Displ[id_below]  .= -crack_perp_displacement(z_shift[id_below], Sill_thick/2; r=R)
     end
 
     # use WENO5 to advect the temperature field
     T_adv = semilagrangian_advection(T, Displ, z)
 
-    # set sill temperature
-    ind = findall( abs.(z .- Sill_z0) .<= Sill_thick/2)
-    T_adv[ind]  .= Sill_T
+    # Mix the new sill into each overlapped control volume. This remains defined when a
+    # sill is thinner than the grid spacing or falls between nodes.
+    edges = grid_cell_edges(z)
+    sill_widths = interval_cell_widths(z, z_lo, z_hi)
+    sill_fraction = sill_widths ./ diff(edges)
+    T_adv .= (1 .- sill_fraction) .* T_adv .+ sill_fraction .* Sill_T
 
     # move host rock and previously injected material with the same (elastic or constant)
-    # displacement as T. Use the conservative (finite-volume) remap, not semi-Lagrangian
-    # interpolation + round: the latter is non-conservative under the diverging injection
-    # displacement and ratchets grey away (~2-3% of the injected crust lost per sill, since
-    # a boundary cell that interpolates just under 0.5 rounds to 0 and never comes back).
-    # The remap keeps Σ rocks·Δz == injected crust thickness; the field stays fractional.
+    # displacement as T. The indicator stores injected-magma content per grid control volume;
+    # values can exceed one where emplacement compresses previously injected material.
     rock_adv = conservative_advection(rocks, Displ, z)
-    rock_adv[ind]  .= Sill_phase
+    h_out = nonnegative_debit(integrated_content(rocks, z),
+        integrated_content(rock_adv, z), "injected-magma content")
+    add_uniform_content!(rock_adv, z, z_lo, z_hi, Sill_phase*Sill_thick)
 
-    return T_adv, rock_adv
+    return T_adv, rock_adv, h_out
 end
 
 """
@@ -251,6 +555,8 @@ Do semilagrangian_advection
 function semilagrangian_advection(T, Displ, z)
 
     z_new = z + Displ # advect grid
+    all(>(0), diff(z_new)) ||
+        throw(ArgumentError("displacement folds the grid; advected coordinates must be strictly ascending"))
     interp_linear = linear_interpolation(z_new, T);
     T_adv = interp_linear.(z)
 
@@ -261,11 +567,11 @@ end
     conservative_advection(field, Displ, z)
 
 Finite-volume (mass-conserving) advection of a per-cell `field` by the displacement
-`Displ` [m] on the uniform grid `z`. Unlike [`semilagrangian_advection`](@ref) — which
-interpolates the *value* and so lets `Σ field·Δz` drift wherever the displacement
-stretches or compresses the grid — this moves each cell's *content* `field·Δz`: cell
+`Displ` [m] on grid `z`. Unlike [`semilagrangian_advection`](@ref) — which
+interpolates the *value* and lets integrated content drift wherever the displacement
+stretches or compresses the grid — this moves each control volume's content: cell
 edges are displaced (Displ interpolated to the edges) and every parcel deposits its
-conserved content onto the fixed cells it overlaps. `Σ field·Δz` is preserved exactly
+conserved content onto the fixed cells it overlaps. [`integrated_content`](@ref) is preserved exactly
 (up to parcels pushed past the domain boundary).
 
 Use this for the injected-rock phase indicator, whose integral is the injected crust
@@ -274,52 +580,43 @@ of ~2-3% per injection). Temperature keeps using `semilagrangian_advection` — 
 intensive field where the stretch-induced drift is small and expected.
 """
 function conservative_advection(field, Displ, z)
+    length(field) == length(Displ) == length(z) ||
+        throw(DimensionMismatch("field, Displ, and z must have equal length"))
+    all(isfinite, field) && all(isfinite, Displ) ||
+        throw(ArgumentError("field and Displ must be finite"))
     n  = length(z)
-    Δz = abs(z[2] - z[1])
-    ze = vcat(z .- Δz/2, z[end] + Δz/2)                       # n+1 cell edges
+    ze = grid_cell_edges(z)
+    widths = diff(ze)
     de = linear_interpolation(z, Displ; extrapolation_bc=Line()).(ze)
-    xe = ze .+ de                                             # displaced edges
-    out = zeros(n)
+    xe = ze .+ de
+    all(>(0), diff(xe)) ||
+        throw(ArgumentError("displacement folds a control volume; displaced edges must be strictly ascending"))
+    out = zeros(promote_type(eltype(field), eltype(ze)), n)
     for j in 1:n
         L, R = xe[j], xe[j+1]
         w = R - L
-        w <= 0 && continue                                   # folded/collapsed parcel
-        ρ  = field[j]*Δz/w                                    # conserved content spread over new width
-        i1 = clamp(floor(Int, (L - ze[1])/Δz) + 1, 1, n)
-        i2 = clamp(ceil(Int,  (R - ze[1])/Δz),     1, n)
+        density = field[j]*widths[j]/w
+        i1 = clamp(searchsortedlast(ze, L), 1, n)
+        i2 = clamp(searchsortedfirst(ze, R) - 1, 1, n)
         for i in i1:i2
             ov = min(R, ze[i+1]) - max(L, ze[i])
-            ov > 0 && (out[i] += ρ*ov/Δz)
+            ov > 0 && (out[i] += density*ov/widths[i])
         end
     end
     return out
 end
 
-"""
-    find_eruptible_region(ϕ, z; ϕ_threshold=0.5)
-
-Find the envelope `[z_bot, z_top]` (in the grid's units, e.g. m) of the largest
-contiguous run of grid points where the melt fraction `ϕ` exceeds `ϕ_threshold`,
-anywhere in the column. Separate melt lenses are not combined: only the single
-longest contiguous run is returned, so an isolated near-threshold point far from the
-real melt zone can't inflate the reported thickness. Returns `nothing` if no point
-exceeds the threshold.
-"""
-function find_eruptible_region(ϕ, z; ϕ_threshold=0.5)
-    above = ϕ .> ϕ_threshold
-    any(above) || return nothing
-
+function largest_contiguous_range(mask)
     best_len = 0
     best_lo  = 0
     best_hi  = 0
-    run_lo   = 0
     i = 1
-    n = length(above)
+    n = length(mask)
     while i <= n
-        if above[i]
+        if mask[i]
             run_lo = i
             j = i
-            while j <= n && above[j]
+            while j <= n && mask[j]
                 j += 1
             end
             run_len = j - run_lo
@@ -333,8 +630,22 @@ function find_eruptible_region(ϕ, z; ϕ_threshold=0.5)
             i += 1
         end
     end
+    return best_len == 0 ? nothing : best_lo:best_hi
+end
 
-    return z[best_lo], z[best_hi]
+"""
+    find_eruptible_region(ϕ, z; ϕ_threshold=0.5)
+
+Find the envelope `[z_bot, z_top]` of the largest contiguous run where `ϕ` exceeds
+`ϕ_threshold`. Separate melt lenses are not combined. Returns `nothing` if no point
+exceeds the threshold.
+"""
+function find_eruptible_region(ϕ, z; ϕ_threshold=0.5)
+    length(ϕ) == length(z) || throw(DimensionMismatch("ϕ and z must have equal length"))
+    run = largest_contiguous_range(ϕ .> ϕ_threshold)
+    run === nothing && return nothing
+
+    return z[first(run)], z[last(run)]
 end
 
 """
@@ -399,6 +710,8 @@ compression paying for the floor-side stretch is thereby concentrated in the roo
 just above the vent.
 """
 function collapse_displacement(zv; Erupt_z0, Erupt_thick, R=Erupt_thick/2, method=:elastic)
+    method in (:elastic, :hybrid) ||
+        throw(ArgumentError("collapse_displacement supports only :elastic and :hybrid, got $method"))
     half = Erupt_thick/2
     z_shift = zv .- Erupt_z0
     Displ   = zero(z_shift)
@@ -452,10 +765,13 @@ function collapse_displacement(zv; Erupt_z0, Erupt_thick, R=Erupt_thick/2, metho
 end
 
 """
-    erupt_melt!(T, rocks, z; Erupt_z0, Erupt_thick)
+    T_new, rock_new, h_out = erupt_melt!(T, rocks, z; Erupt_z0, Erupt_thick, method=:caldera)
 
 Erupt a melt region of thickness `Erupt_thick` [m] centered at `Erupt_z0` [m], the
-inverse of `insert_sill`. Two closure mechanisms are available via `method`:
+inverse of `insert_sill`. `h_out` is the injected-magma content [m] the closure takes out of
+the column - the erupted band's own content plus anything the closure displaces past a
+domain boundary - and is the withdrawal term of the magma-volume budget
+([`MassBudget`](@ref)). Two closure mechanisms are available via `method`:
 
 - `:caldera` (default) - roof subsidence: the erupted band's cells are deleted (the
   magma and its heat leave the system) and the entire roof block above the band drops
@@ -465,8 +781,8 @@ inverse of `insert_sill`. Two closure mechanisms are available via `method`:
   changes temperature: the roof block's profile is translated, not deformed, so the
   column's total heat drops by exactly the erupted band's content (minus the
   negligible cold surface fill) without any artificial cooling around the vent.
-  `rocks` subsides the same way, so `sum(rocks)` drops by exactly the erupted band's
-  grey content.
+  `rocks` subsides the same way, so its integrated content drops by the erupted band's
+  intruded-magma content.
 
 - `:elastic` - elastic collapse: host rock on both sides moves toward the vent with
   `collapse_advection`'s elastic decay law (largest at the band edges, decaying with
@@ -474,7 +790,7 @@ inverse of `insert_sill`. Two closure mechanisms are available via `method`:
   displacement (re-binarized by rounding). Temperatures are transported as intensive
   values, so the stretched walls re-cover the vent at their own temperature - the
   column's total heat drops by much less than the erupted band's content, and
-  `sum(rocks)` drops by less than the band's grey content.
+  the integrated `rocks` content drops by less than the band's intruded-magma content.
 
 - `:hybrid` - elastic + caldera: the floor rises elastically toward the vent as in
   `:elastic`, while the roof face drops to meet it and the roof displacement
@@ -487,9 +803,13 @@ inverse of `insert_sill`. Two closure mechanisms are available via `method`:
   above the vent).
 """
 function erupt_melt!(T, rocks, z; Erupt_z0, Erupt_thick, method=:caldera)
+    method in (:caldera, :elastic, :hybrid) ||
+        throw(ArgumentError("unknown eruption collapse method: $method"))
     half = Erupt_thick/2
     zv = Vector(z)
     n  = length(zv)
+    magma_out(rock_new) = nonnegative_debit(integrated_content(rocks, zv),
+        integrated_content(rock_new, zv), "injected-magma content")
 
     if method == :elastic || method == :hybrid
         T_new    = collapse_advection(Vector(T), zv; Erupt_z0=Erupt_z0, Erupt_thick=Erupt_thick, method=method)
@@ -505,14 +825,14 @@ function erupt_melt!(T, rocks, z; Erupt_z0, Erupt_thick, method=:caldera)
         src      = copy(Vector(rocks))
         src[findall(abs.(zv .- Erupt_z0) .<= half)] .= 0.0   # erupted band grey leaves the system
         rock_new = conservative_advection(src, Displ, zv)
-        return T_new, rock_new
+        return T_new, rock_new, magma_out(rock_new)
     end
 
     T_new    = copy(Vector(T))
     rock_new = copy(Vector(rocks))
 
     ind = findall(abs.(zv .- Erupt_z0) .<= half)
-    isempty(ind) && return T_new, rock_new
+    isempty(ind) && return T_new, rock_new, 0.0
 
     n_band = length(ind)
     i0 = ind[1]
@@ -521,68 +841,7 @@ function erupt_melt!(T, rocks, z; Erupt_z0, Erupt_thick, method=:caldera)
     T_new[n-n_band+1:n]    .= T_new[n]               # subsided surface, filled at Ttop
     rock_new[n-n_band+1:n] .= 0.0
 
-    return T_new, rock_new
-end
-
-"""
-    collapse_conservative(T, z; Erupt_z0, Erupt_thick, R=Erupt_thick/2)
-
-Conservative (finite-volume) version of `collapse_advection` for the temperature
-field: instead of interpolating temperatures (which preserves the intensive value but
-lets the integrated heat grow wherever the walls stretch), the *heat content* of each
-material parcel is transported and deposited.
-
-Each grid cell is treated as a material parcel of width `Δz` carrying content
-`T*Δz`. The parcels inside the erupted band are deleted - erupted material leaves the
-system together with its heat. The surviving parcels' edges move with the same
-elastic decay law as `collapse_advection` (rescaled so the two wall faces meet
-exactly at `Erupt_z0`, with the domain-boundary edges pinned), and each parcel then
-deposits its conserved content onto the cells it overlaps. A parcel stretched to
-width `w` therefore reads a diluted temperature `T*Δz/w`: the column's total
-`Σ T Δz` drops by exactly the erupted band's content, paid by the stretched walls.
-"""
-function collapse_conservative(T, z; Erupt_z0, Erupt_thick, R=Erupt_thick/2)
-    half = Erupt_thick/2
-    zv = Vector(z)
-    n  = length(zv)
-    Δz = zv[2] - zv[1]
-
-    ind = findall(abs.(zv .- Erupt_z0) .<= half)
-    isempty(ind) && return copy(Vector(T))
-
-    # material-cell edges on the (uniform) grid
-    ze = vcat(zv .- Δz/2, zv[end] + Δz/2)
-
-    # edge displacements: elastic decay away from the wall faces (the outer edges of
-    # the deleted band), rescaled so each face lands exactly on Erupt_z0
-    De  = zeros(n+1)
-    ref = crack_perp_displacement(0.0, half; r=R)
-    j_lo = ind[1]          # edge index of the lower wall face
-    j_hi = ind[end] + 1    # edge index of the upper wall face
-    d_lo = ze[j_lo] .- ze[1:j_lo]
-    d_hi = ze[j_hi:n+1] .- ze[j_hi]
-    De[1:j_lo]   .=  (Erupt_z0 - ze[j_lo]) .* crack_perp_displacement(d_lo, half; r=R) ./ ref
-    De[j_hi:n+1] .= -(ze[j_hi] - Erupt_z0) .* crack_perp_displacement(d_hi, half; r=R) ./ ref
-    De[1]   = 0.0   # pinned domain boundaries, as in collapse_displacement
-    De[n+1] = 0.0
-    xe = ze .+ De
-
-    # deposit each surviving parcel's conserved content T*Δz onto the fixed grid
-    T_new = zeros(n)
-    for j in vcat(1:ind[1]-1, ind[end]+1:n)
-        L, Rj = xe[j], xe[j+1]
-        w = Rj - L
-        w <= 0 && continue
-        ρT = T[j]*Δz/w
-        i1 = clamp(floor(Int, (L  - ze[1])/Δz) + 1, 1, n)
-        i2 = clamp(ceil(Int,  (Rj - ze[1])/Δz),     1, n)
-        for i in i1:i2
-            ov = min(Rj, ze[i+1]) - max(L, ze[i])
-            ov > 0 && (T_new[i] += ρT*ov/Δz)
-        end
-    end
-
-    return T_new
+    return T_new, rock_new, magma_out(rock_new)
 end
 
 """
@@ -595,10 +854,7 @@ amplitude and the erupted volume (`A_sill * melt_thickness`) are based on the me
 content rather than on the bulk band thickness.
 """
 function melt_thickness(ϕ, z, z_lo, z_hi)
-    zv = Vector(z)
-    Δz = zv[2] - zv[1]
-    ind = findall(z_lo .<= zv .<= z_hi)
-    return sum(ϕ[ind]) * Δz
+    return integrated_content(ϕ, z, z_lo, z_hi)
 end
 
 """
@@ -615,15 +871,210 @@ so it conserves energy only approximately. Measure `H` before and after `erupt_m
 quantify that drift before trusting reservoir Tt-paths / zircon spectra from those methods.
 """
 function column_enthalpy(T, z, MatParam, Phases)
-    Δz   = abs(z[2] - z[1])
     args = (T = T .+ 273.15,)
     ρ    = similar(T); Cp = similar(T); Hl = similar(T); ϕ = similar(T)
     compute_density!(ρ, MatParam, Phases, args)
     compute_heatcapacity!(Cp, MatParam, Phases, args)
     compute_latent_heat!(Hl, MatParam, Phases, args)
     compute_meltfraction!(ϕ, MatParam, Phases, args)
-    return sum(ρ .* (Cp .* T .+ Hl .* ϕ)) * Δz
+    return integrated_content(ρ .* (Cp .* T .+ Hl .* ϕ), z)
 end
+
+"""
+    conductive_boundary_energy(T, k, z, Δt) -> E [J/m²]
+
+Net conductive heat entering the column during one timestep. This is the exact
+boundary term obtained by summing the finite-difference diffusion operator over the
+interior nodes; positive values heat the column.
+"""
+function conductive_boundary_energy(T, k, z, Δt)
+    length(T) == length(z) || throw(DimensionMismatch("T and z must have equal length"))
+    length(k) == length(z) - 1 || throw(DimensionMismatch("k must have length(z) - 1 entries"))
+    Δt >= 0 || throw(ArgumentError("Δt must be nonnegative"))
+    Δz = z[2] - z[1]
+    Δz > 0 || throw(ArgumentError("z must be strictly ascending"))
+    return (k[end] * (T[end] - T[end-1]) - k[1] * (T[2] - T[1])) / Δz * Δt
+end
+
+"""
+    source_energy(Q, z, Δt) -> E [J/m²]
+
+Heat supplied by the volumetric source during one timestep, using the same interior
+nodes as the thermal residual.
+"""
+function source_energy(Q, z, Δt)
+    length(Q) == length(z) || throw(DimensionMismatch("Q and z must have equal length"))
+    Δt >= 0 || throw(ArgumentError("Δt must be nonnegative"))
+    return sum(@view Q[2:end-1]) * (z[2] - z[1]) * Δt
+end
+
+"""
+    magma_heat_input(T_host, Tsill, h, MatParam; phase=0) -> E [J/m²]
+
+Sensible plus latent heat supplied by `h` meters of initially liquid magma relative
+to host material at `T_host`. This is the discrete-sill counterpart of the integrand
+used by [`compute_Q_magma!`](@ref), and shares its density approximation: the magma is
+weighted by the host-rock thermal density of `MatParam` at `T_host`, not by
+`EruptionParams.ρ_melt`.
+"""
+function magma_heat_input(T_host, Tsill, h, MatParam; phase=0)
+    h >= 0 || throw(ArgumentError("h must be nonnegative"))
+    T = [float(T_host)]
+    phases = [phase]
+    args = (T = T .+ 273.15,)
+    ρ = similar(T); Cp = similar(T); Hl = similar(T); ϕ = similar(T)
+    compute_density!(ρ, MatParam, phases, args)
+    compute_heatcapacity!(Cp, MatParam, phases, args)
+    compute_latent_heat!(Hl, MatParam, phases, args)
+    compute_meltfraction!(ϕ, MatParam, phases, args)
+    return h * ρ[1] * (Cp[1] * (Tsill - T_host) + Hl[1] * (1 - ϕ[1]))
+end
+
+"""
+    erupted_melt_enthalpy(T, ϕ, z, z_lo, z_hi, h, MatParam, Phases) -> E [J/m²]
+
+Enthalpy carried by `h` meters of melt sampled from the eruptible interval. Local
+enthalpy is weighted by melt content `ϕΔz`; the liquid carries sensible heat and the
+full latent heat of fusion. Temperature uses the same 0 °C reference as
+[`column_enthalpy`](@ref).
+"""
+function erupted_melt_enthalpy(T, ϕ, z, z_lo, z_hi, h, MatParam, Phases)
+    h >= 0 || throw(ArgumentError("h must be nonnegative"))
+    length(T) == length(ϕ) == length(z) == length(Phases) ||
+        throw(DimensionMismatch("T, ϕ, z, and Phases must have equal length"))
+    ind = findall(z_lo .<= z .<= z_hi)
+    isempty(ind) && return 0.0
+    edges = grid_cell_edges(z)
+    geometric_weights = [max(0.0, min(edges[i + 1], z_hi) - max(edges[i], z_lo)) for i in ind]
+    weights = ϕ[ind] .* geometric_weights
+    total = sum(weights)
+    total > 0 || return 0.0
+    args = (T = T .+ 273.15,)
+    ρ = similar(T); Cp = similar(T); Hl = similar(T)
+    compute_density!(ρ, MatParam, Phases, args)
+    compute_heatcapacity!(Cp, MatParam, Phases, args)
+    compute_latent_heat!(Hl, MatParam, Phases, args)
+    return h * sum(weights .* ρ[ind] .* (Cp[ind] .* T[ind] .+ Hl[ind])) / total
+end
+
+"""
+    EnthalpyBudget(initial_storage)
+
+Cumulative column-energy diagnostic per unit area. `residual` is
+
+`storage - initial_storage - boundary - injected - source + erupted`.
+
+It deliberately exposes heat created or retained by intensive temperature remapping;
+it does not correct transport.
+"""
+Base.@kwdef mutable struct EnthalpyBudget
+    initial_storage :: Float64
+    storage         :: Float64
+    boundary        :: Float64 = 0.0
+    injected        :: Float64 = 0.0
+    source          :: Float64 = 0.0
+    erupted         :: Float64 = 0.0
+    residual        :: Float64 = 0.0
+end
+
+EnthalpyBudget(initial_storage) = EnthalpyBudget(; initial_storage, storage=initial_storage)
+
+"""
+    update_enthalpy_budget!(budget, storage; boundary=0, injected=0, source=0, erupted=0)
+
+Record the current column storage and accumulate the energy exchanged during one timestep,
+refreshing `budget.residual` (see [`EnthalpyBudget`](@ref)).
+"""
+function update_enthalpy_budget!(budget::EnthalpyBudget, storage;
+                                 boundary=0.0, injected=0.0, source=0.0, erupted=0.0)
+    all(isfinite, (storage, boundary, injected, source, erupted)) ||
+        throw(ArgumentError("enthalpy-budget terms must be finite"))
+    budget.storage = storage
+    budget.boundary += boundary
+    budget.injected += injected
+    budget.source += source
+    budget.erupted += erupted
+    budget.residual = storage - budget.initial_storage - budget.boundary -
+                      budget.injected - budget.source + budget.erupted
+    return budget
+end
+
+enthalpy_budget_snapshot(budget::EnthalpyBudget) = (;
+    storage=budget.storage,
+    storage_change=budget.storage - budget.initial_storage,
+    boundary=budget.boundary,
+    injected=budget.injected,
+    source=budget.source,
+    erupted=budget.erupted,
+    residual=budget.residual,
+)
+
+"""
+    MassBudget(magma, melt)
+
+Cumulative per-unit-area thickness budget [m] of the two quantities repeated injection
+supplies: intruded magma and stored melt. They share the injected term but close
+differently, and only the first one closes to zero.
+
+- `residual = injected - withdrawn - (magma - initial_magma)` is the **magma-volume
+  budget**. `magma` is the injected-rock control-volume content and `withdrawn` is the
+  magma removed by eruption or displaced past a domain boundary. Exact additive injection
+  makes this balance close up to remapping roundoff.
+- `melt_residual = injected - erupted - (melt - initial_melt)` is the **melt-content
+  residual**. It is not a crystallization measurement: it combines crystallization,
+  host-rock melting, boundary transport, and any mismatch between booked and physically
+  represented melt withdrawal.
+
+Like [`EnthalpyBudget`](@ref) this diagnoses transport and never corrects it.
+"""
+Base.@kwdef mutable struct MassBudget
+    initial_magma :: Float64
+    initial_melt  :: Float64
+    magma         :: Float64
+    melt          :: Float64
+    injected      :: Float64 = 0.0
+    withdrawn     :: Float64 = 0.0
+    erupted       :: Float64 = 0.0
+    residual      :: Float64 = 0.0
+    melt_residual :: Float64 = 0.0
+end
+
+MassBudget(magma, melt) = MassBudget(; initial_magma=magma, initial_melt=melt, magma, melt)
+
+"""
+    update_mass_budget!(budget, magma, melt; injected=0, withdrawn=0, erupted=0)
+
+Record the current intruded-magma content `magma` [m] and stored melt `melt` [m] and
+accumulate the thicknesses exchanged during one timestep, refreshing `budget.residual` and
+`budget.melt_residual` (see [`MassBudget`](@ref)).
+"""
+function update_mass_budget!(budget::MassBudget, magma, melt;
+                             injected=0.0, withdrawn=0.0, erupted=0.0)
+    all(isfinite, (magma, melt, injected, withdrawn, erupted)) ||
+        throw(ArgumentError("mass-budget terms must be finite"))
+    all(>=(0), (magma, melt, injected, withdrawn, erupted)) ||
+        throw(ArgumentError("mass-budget terms must be nonnegative"))
+    budget.magma = magma
+    budget.melt = melt
+    budget.injected += injected
+    budget.withdrawn += withdrawn
+    budget.erupted += erupted
+    budget.residual = budget.injected - budget.withdrawn - (magma - budget.initial_magma)
+    budget.melt_residual = budget.injected - budget.erupted - (melt - budget.initial_melt)
+    return budget
+end
+
+mass_budget_snapshot(budget::MassBudget) = (;
+    magma=budget.magma,
+    melt=budget.melt,
+    magma_change=budget.magma - budget.initial_magma,
+    melt_change=budget.melt - budget.initial_melt,
+    injected=budget.injected,
+    withdrawn=budget.withdrawn,
+    erupted=budget.erupted,
+    residual=budget.residual,
+    melt_residual=budget.melt_residual,
+)
 
 """
     erupt_displacement(zm, Erupt_z0, Erupt_thick; method=:caldera, R=Erupt_thick/2)
@@ -638,6 +1089,8 @@ while above it the drop transitions from `Erupt_thick/2` at the wall face to the
 full rigid `Erupt_thick` subsidence far above the vent.
 """
 function erupt_displacement(zm, Erupt_z0, Erupt_thick; method=:caldera, R=Erupt_thick/2)
+    method in (:caldera, :elastic, :hybrid) ||
+        throw(ArgumentError("unknown eruption collapse method: $method"))
     half = Erupt_thick/2
     s = zm - Erupt_z0
     if method == :elastic
@@ -671,9 +1124,9 @@ end
     collapse_tracers!(tracers, Erupt_z0, Erupt_thick; method=:caldera)
 
 Move the passive tracers with the eruption closure, consistent with `erupt_melt!`
-(see `erupt_displacement` for the two `method`s). Tracers inside the erupted band
-should already have been removed with `extract_erupted_tracers!` - any remaining
-there are placed on the closed vent.
+(see `erupt_displacement` for the two `method`s). Cargo tracers selected by
+`extract_erupted_tracers!` are removed first; unselected tracers inside the collapsing
+band are placed on the closed vent.
 """
 function collapse_tracers!(tracers, Erupt_z0, Erupt_thick; method=:caldera)
     for tracer in tracers
@@ -683,18 +1136,189 @@ function collapse_tracers!(tracers, Erupt_z0, Erupt_thick; method=:caldera)
 end
 
 """
-    extract_erupted_tracers!(tracers, Erupt_z0, Erupt_thick)
+    extract_erupted_tracers!(rng, tracers, ϕ, z, z_lo, z_hi, h_erupt;
+                             eligible_phase)
 
-Remove all tracers within the erupted band `[Erupt_z0 - Erupt_thick/2, Erupt_z0 + Erupt_thick/2]`
-from `tracers` (in place) and return them as a separate `Vector{Tracer}`, so zircon ages can
-be computed specifically from the population of tracers that has just erupted.
+Remove a melt-representative sample of tracers from the full eruptible mush
+`[z_lo, z_hi]`. An eligible tracer in grid cell `i` represents melt thickness
+`ϕ[i]w[i]/n[i]`, where `w[i]` is that control volume's overlap with the interval and
+`n[i]` is the number of eligible tracers in that cell, so
+changing the tracer-seeding density does not change the represented cargo. Sampling
+is without replacement and weighted by represented melt thickness until `h_erupt`
+is approximated.
+
+Pass `eligible_phase=nothing` to include host-rock and injected tracers, or a phase
+number to restrict cargo to that phase. The keyword is required so phase eligibility
+cannot be ignored accidentally. Returns `(erupted, h_cargo)`, where `h_cargo` is the
+melt thickness represented by the selected tracers. The caller owns `rng`; stochastic
+tests should pass a seeded generator. When all phases are eligible, the tracer weights
+are normalized to the full melt content of the interval so empty tracer cells do not
+make the sampled cargo underrepresent the withdrawn state.
 """
-function extract_erupted_tracers!(tracers, Erupt_z0, Erupt_thick)
-    zlo, zhi = Erupt_z0 - Erupt_thick/2, Erupt_z0 + Erupt_thick/2
-    is_erupted = [zlo <= tracer.z <= zhi for tracer in tracers]
+function extract_erupted_tracers!(rng, tracers, ϕ, z, z_lo, z_hi, h_erupt; eligible_phase)
+    h_erupt >= 0 || throw(ArgumentError("h_erupt must be nonnegative"))
+    length(ϕ) == length(z) || throw(DimensionMismatch("ϕ and z must have equal length"))
+    length(z) >= 2 || throw(ArgumentError("z must contain at least two grid points"))
+
+    Δz = z[2] - z[1]
+    Δz > 0 || throw(ArgumentError("z must be strictly ascending"))
+    candidate_indices = Int[]
+    cell_indices = Int[]
+    counts = zeros(Int, length(z))
+    for (j, tracer) in pairs(tracers)
+        z_lo <= tracer.z <= z_hi || continue
+        (isnothing(eligible_phase) || tracer.phase == eligible_phase) || continue
+        i = clamp(round(Int, (tracer.z - z[1]) / Δz) + 1, 1, length(z))
+        ϕ[i] > 0 || continue
+        push!(candidate_indices, j)
+        push!(cell_indices, i)
+        counts[i] += 1
+    end
+
+    isempty(candidate_indices) && return tracers[Int[]], 0.0
+    widths = interval_cell_widths(z, z_lo, z_hi)
+    weights = [ϕ[i] * widths[i] / counts[i] for i in cell_indices]
+    if isnothing(eligible_phase)
+        weights .*= melt_thickness(ϕ, z, z_lo, z_hi) / sum(weights)
+    end
+    total = sum(weights)
+    target = min(h_erupt, total)
+    target > 0 || return tracers[Int[]], 0.0
+
+    order = target == total ? eachindex(weights) : sortperm(randexp(rng, length(weights)) ./ weights)
+    selected = Int[]
+    h_cargo = 0.0
+    last_weight = 0.0
+    for k in order
+        push!(selected, candidate_indices[k])
+        last_weight = weights[k]
+        h_cargo += last_weight
+        h_cargo >= target && break
+    end
+    if length(selected) > 1
+        if abs(h_cargo - last_weight - target) < abs(h_cargo - target)
+            pop!(selected)
+            h_cargo -= last_weight
+        end
+    end
+
+    is_erupted = falses(length(tracers))
+    is_erupted[selected] .= true
     erupted = tracers[is_erupted]
     deleteat!(tracers, is_erupted)
-    return erupted
+    return erupted, h_cargo
+end
+
+"""
+    EruptionEvent(; ...)
+
+One realized eruption and its four independently supplied thickness accounts. Separate
+trigger and realization times preserve the delay when sub-grid D&H drainage aggregates.
+Construction fails unless requested, state-withdrawn, cargo-represented, and booked
+thickness agree. State and booking must agree to floating-point precision; cargo may
+differ by the explicitly declared tracer-resolution tolerance `cargo_atol`.
+
+`magma_removed` is the intruded-magma content the closure took out of the column.
+`melt_removed` is the measured change in full-column melt storage across the instantaneous
+closure. It can differ from `requested` because the fixed-grid closure transports
+temperature intensively; this diagnostic exposes that mismatch instead of relabeling the
+requested closure amplitude as a measured state withdrawal.
+"""
+struct EruptionEvent
+    trigger_time        :: Float64
+    realization_time    :: Float64
+    requested           :: Float64
+    state_withdrawn     :: Float64
+    cargo_represented   :: Float64
+    booked              :: Float64
+    z_lo                :: Float64
+    z_hi                :: Float64
+    z_centroid          :: Float64
+    trigger             :: Symbol
+    closure             :: Symbol
+    aggregated          :: Bool
+    cargo_count         :: Int
+    enthalpy_before     :: Float64
+    enthalpy_after      :: Float64
+    erupted_enthalpy    :: Float64
+    enthalpy_residual   :: Float64
+    magma_removed       :: Float64
+    melt_removed        :: Float64
+end
+
+function EruptionEvent(; trigger_time, realization_time, requested, state_withdrawn,
+                       cargo_represented, booked,
+                       z_lo, z_hi, z_centroid, trigger, closure, aggregated=false,
+                       cargo_count=0, enthalpy_before, enthalpy_after, erupted_enthalpy,
+                       magma_removed=0.0, melt_removed=0.0, cargo_atol=0.0)
+    thicknesses = (requested, state_withdrawn, cargo_represented, booked)
+    all(isfinite, thicknesses) || throw(ArgumentError("eruption thicknesses must be finite"))
+    all(x -> x >= 0, thicknesses) ||
+        throw(ArgumentError("eruption thicknesses must be nonnegative"))
+    cargo_atol >= 0 || throw(ArgumentError("cargo_atol must be nonnegative"))
+    all(isfinite, (trigger_time, realization_time, z_lo, z_hi, z_centroid,
+                   enthalpy_before, enthalpy_after, erupted_enthalpy,
+                   magma_removed, melt_removed)) ||
+        throw(ArgumentError("eruption event values must be finite"))
+    magma_removed >= 0 || throw(ArgumentError("magma_removed must be nonnegative"))
+    cargo_count >= 0 || throw(ArgumentError("cargo_count must be nonnegative"))
+    scale = max(maximum(thicknesses), 1.0)
+    atol = 64eps(scale)
+    isapprox(state_withdrawn, requested; rtol=0, atol) &&
+    isapprox(booked, requested; rtol=0, atol) &&
+    isapprox(cargo_represented, requested; rtol=0, atol=cargo_atol + atol) ||
+        throw(ArgumentError("eruption thickness mismatch: requested=$requested, " *
+            "state-withdrawn=$state_withdrawn, cargo-represented=$cargo_represented, " *
+            "booked=$booked (cargo tolerance=$cargo_atol)"))
+    closure in (:caldera, :elastic, :hybrid) ||
+        throw(ArgumentError("unknown eruption collapse method: $closure"))
+    Hres = enthalpy_after - enthalpy_before + erupted_enthalpy
+    trigger_time <= realization_time ||
+        throw(ArgumentError("trigger_time must not exceed realization_time"))
+    return EruptionEvent(trigger_time, realization_time, requested, state_withdrawn,
+        cargo_represented, booked, z_lo, z_hi, z_centroid, Symbol(trigger), closure,
+        aggregated, cargo_count, enthalpy_before, enthalpy_after, erupted_enthalpy, Hres,
+        magma_removed, melt_removed)
+end
+
+"""
+    realize_eruption!(rng, T, rocks, tracers, ϕ, z, MatParam, Phases; ...) ->
+        (T_new, rocks_new, cargo, event)
+
+Withdraw the thermal/rock state and represented tracer cargo as one operation, then
+construct the fail-fast [`EruptionEvent`](@ref). The default cargo tolerance is half a
+grid cell, the sampler's maximum nearest-whole-tracer rounding error when the eligible
+population represents the full mush.
+"""
+function realize_eruption!(rng, T, rocks, tracers, ϕ, z, MatParam, Phases;
+                           realization_time, trigger_time=realization_time,
+                           h_requested, h_booked=h_requested, z_lo, z_hi,
+                           trigger, closure, aggregated=false, eligible_phase,
+                           cargo_atol=(z[2] - z[1]) / 2)
+    h_requested > 0 || throw(ArgumentError("h_requested must be positive"))
+    z_hi > z_lo || throw(ArgumentError("z_hi must be greater than z_lo"))
+    widths = interval_cell_widths(z, z_lo, z_hi)
+    weights = ϕ .* widths
+    ind = findall(z_lo .<= z .<= z_hi)
+    h_melt = sum(weights[ind])
+    h_melt > 0 || throw(ArgumentError("eruptible interval contains no melt"))
+    z_centroid = sum(weights[ind] .* z[ind]) / h_melt
+    H_before = column_enthalpy(T, z, MatParam, Phases)
+    H_erupted = erupted_melt_enthalpy(T, ϕ, z, z_lo, z_hi, h_requested, MatParam, Phases)
+    T_new, rocks_new, magma_removed = erupt_melt!(T, rocks, z;
+        Erupt_z0=(z_lo + z_hi) / 2, Erupt_thick=h_requested, method=closure)
+    cargo, h_cargo = extract_erupted_tracers!(rng, tracers, ϕ, z, z_lo, z_hi,
+        h_requested; eligible_phase)
+    H_after = column_enthalpy(T_new, z, MatParam, Phases)
+    ϕ_after = similar(ϕ)
+    compute_meltfraction!(ϕ_after, MatParam, Phases, (T = T_new .+ 273.15,))
+    melt_removed = integrated_content(ϕ, z) - integrated_content(ϕ_after, z)
+    event = EruptionEvent(; trigger_time, realization_time, requested=h_requested,
+        state_withdrawn=h_requested, cargo_represented=h_cargo, booked=h_booked,
+        z_lo, z_hi, z_centroid, trigger, closure, aggregated,
+        cargo_count=length(cargo), enthalpy_before=H_before, enthalpy_after=H_after,
+        erupted_enthalpy=H_erupted, magma_removed, melt_removed, cargo_atol)
+    return T_new, rocks_new, cargo, event
 end
 
 # =====================================================================================
@@ -721,6 +1345,8 @@ values and check the paper's Table 1 for a specific system.
 - `β_r`,`η_r`: host-rock stiffness [Pa] and wall relaxation viscosity [Pa·s]
 - `ρ_melt`,`ρ_x`: melt / crystal densities [kg/m³]
 - `m_w`      : total water mass fraction of the magma [-]
+- `z_gas_max`: maximum depth [m] of the shallow zone in which an exsolved gas phase is
+  represented; deeper magma retains its water in the condensed phase and never calls RK
 - `A_visc`,`B_gas`,`G_act`: Arrhenius wall-relaxation-viscosity constants (D&H 2014 Table 1),
   `η(T) = A_visc·exp(G_act/(B_gas·T))`; used to compute `η_r` from the crustal wall T.
 - `ρ_crust`,`g`: crustal density [kg/m³] and gravity [m/s²] for the lithostatic reference
@@ -736,6 +1362,7 @@ Base.@kwdef mutable struct EruptionParams
     ρ_melt   :: Float64 = 2400.0
     ρ_x      :: Float64 = 2700.0
     m_w      :: Float64 = 0.05
+    z_gas_max :: Float64 = 10e3
     A_visc   :: Float64 = 4.25e7        # D&H Table 1: viscosity-law prefactor [Pa·s]
     B_gas    :: Float64 = 8.314         # molar gas constant [J/mol/K]
     G_act    :: Float64 = 141e3         # activation energy for creep [J/mol]
@@ -743,12 +1370,53 @@ Base.@kwdef mutable struct EruptionParams
     g        :: Float64 = 9.81
 end
 
+function validate_eruption_params(ep::EruptionParams)
+    all(isfinite, (ep.ϕ_erupt, ep.ΔP_crit, ep.ϕ_g_crit, ep.ΔP_relax,
+        ep.z_erupt_max, ep.β_r, ep.η_r, ep.ρ_melt, ep.ρ_x, ep.m_w,
+        ep.z_gas_max, ep.A_visc, ep.B_gas, ep.G_act, ep.ρ_crust, ep.g)) ||
+        throw(ArgumentError("eruption parameters must be finite"))
+    0 <= ep.ϕ_erupt <= 1 || throw(DomainError(ep.ϕ_erupt, "ϕ_erupt must lie in [0, 1]"))
+    0 <= ep.ϕ_g_crit <= 1 || throw(DomainError(ep.ϕ_g_crit, "ϕ_g_crit must lie in [0, 1]"))
+    ep.ΔP_crit > 0 || throw(ArgumentError("ΔP_crit must be positive"))
+    0 <= ep.ΔP_relax < ep.ΔP_crit ||
+        throw(ArgumentError("ΔP_relax must lie in [0, ΔP_crit)"))
+    ep.z_erupt_max >= 0 && ep.z_gas_max >= 0 ||
+        throw(ArgumentError("depth limits must be nonnegative"))
+    all(>(0), (ep.β_r, ep.η_r, ep.ρ_melt, ep.ρ_x, ep.A_visc,
+               ep.B_gas, ep.ρ_crust, ep.g)) ||
+        throw(ArgumentError("mechanical, density, and viscosity parameters must be positive"))
+    ep.G_act >= 0 || throw(ArgumentError("G_act must be nonnegative"))
+    0 <= ep.m_w <= 1 || throw(DomainError(ep.m_w, "m_w must lie in [0, 1]"))
+    return ep
+end
+
+"""
+    check_density_consistency(MatParam, ep::EruptionParams; T_ref=800.0, rtol=1e-3, phase=0)
+
+Verify that the host-rock thermal density of `MatParam` (evaluated at `T_ref` [°C])
+agrees with the lithostatic density `ep.ρ_crust`. Chamber crystals and melt are distinct
+materials, so `ep.ρ_x` and `ep.ρ_melt` are deliberately not compared.
+
+Call once at model setup, where the two parameter objects are built.
+"""
+function check_density_consistency(MatParam, ep::EruptionParams; T_ref=800.0, rtol=1e-3, phase=0)
+    rtol >= 0 || throw(ArgumentError("rtol must be nonnegative"))
+    ρ = zeros(1)
+    compute_density!(ρ, MatParam, [phase], (T = [T_ref + 273.15],))
+    isapprox(ρ[1], ep.ρ_crust; rtol) || throw(ArgumentError(
+        "host-rock density mismatch: MatParam gives $(ρ[1]) kg/m³ at $T_ref °C, " *
+        "EruptionParams.ρ_crust is $(ep.ρ_crust) kg/m³ (rtol=$rtol)"))
+    return ρ[1]
+end
+
 """
     EruptionState
 
 Mutable chamber state carried across timesteps: absolute pressure `P`, lithostatic
 reference `P_lith`, gas volume fraction `ϕ_g`, and the previous mush (T,ϕ) for the
-fixed-P density-rate source term.
+fixed-P density-rate source term. `h_erupt` is the melt drained by the pressure ODE
+during the latest thermal step; `h_pending` is drained melt not yet withdrawn from the
+grid because the accumulated thickness is still sub-grid.
 """
 Base.@kwdef mutable struct EruptionState
     P        :: Float64 = 0.0
@@ -758,6 +1426,8 @@ Base.@kwdef mutable struct EruptionState
     ϕ_prev   :: Float64 = NaN          # mush-mean ϕ at previous step
     inv_βm   :: Float64 = 0.0          # magma compressibility 1/β_m at the last step [1/Pa]
     h_erupt  :: Float64 = 0.0          # melt thickness [m] drained by eruptions during the last step
+    h_pending :: Float64 = 0.0          # drained melt [m] awaiting a grid-resolvable withdrawal
+    pending_since :: Float64 = NaN      # time [s] of the first trigger represented by h_pending
     m_diss   :: Float64 = 0.0          # dissolved H₂O mass fraction (per magma mass), Liu 2005
     X_g      :: Float64 = 0.0          # exsolved H₂O gas mass fraction (per magma mass), D&H eq.18
     ρ_gas    :: Float64 = 0.0          # exsolved-gas density [kg/m³] at the last step (modified RK)
@@ -767,31 +1437,90 @@ Base.@kwdef mutable struct EruptionState
 end
 
 """
+    pending_withdrawal!(state, h_requested, h_melt, Δz; time) -> h_realizable
+
+Queue `h_requested` melt thickness drained by the D&H pressure model. Return zero while
+the queued withdrawal is at most `2Δz`; otherwise return the grid-resolvable thickness,
+bounded by the chamber's current `h_melt`. The pending amount is not removed until
+[`commit_pending_withdrawal!`](@ref) is called after the physical state withdrawal.
+`time` is required when starting a new queue so the realized event retains its first
+trigger time.
+"""
+function pending_withdrawal!(state::EruptionState, h_requested, h_melt, Δz; time=NaN)
+    h_requested >= 0 || throw(ArgumentError("h_requested must be nonnegative"))
+    h_melt >= 0 || throw(ArgumentError("h_melt must be nonnegative"))
+    Δz > 0 || throw(ArgumentError("Δz must be positive"))
+    if h_requested > 0 && state.h_pending == 0
+        isfinite(time) || throw(ArgumentError("time must be finite when starting a pending withdrawal"))
+        state.pending_since = time
+    end
+    state.h_pending += h_requested
+    h_realizable = min(state.h_pending, h_melt)
+    return h_realizable > 2Δz ? h_realizable : 0.0
+end
+
+"""
+    commit_pending_withdrawal!(state, h_realized)
+
+Debit a successfully completed physical withdrawal from `state.h_pending`.
+"""
+function commit_pending_withdrawal!(state::EruptionState, h_realized)
+    0 <= h_realized <= state.h_pending ||
+        throw(ArgumentError("h_realized must lie between zero and the pending withdrawal"))
+    state.h_pending -= h_realized
+    if state.h_pending <= 64eps(max(h_realized, 1.0))
+        state.h_pending = 0.0
+        state.pending_since = NaN
+    end
+    return state
+end
+
+"""
     rho_gas_RK(P, T_K) -> ρ_g [kg/m³]
 
 Modified Redlich–Kwong parameterisation for H₂O gas density (Huber et al. 2010, D&H eq.
-A.1), valid ~873<T<1173 K and 30<P<400 MPa (chambers sit in this box). `P` in Pa (used as
-bar internally), `T_K` in K (used as °C). Ported from the reference `eos_g.m`.
+A.1), valid for 873.15–1173.15 K and 30–400 MPa. Calls outside that calibration box
+throw instead of extrapolating. `P` is in Pa (used as bar internally), `T_K` in K (used
+as °C).
 """
 function rho_gas_RK(P, T_K)
+    all(isfinite, (P, T_K)) || throw(ArgumentError("P and T_K must be finite"))
+    30e6 <= P <= 400e6 || throw(DomainError(P,
+        "modified RK H₂O EOS is calibrated only for 30–400 MPa"))
+    873.15 <= T_K <= 1173.15 || throw(DomainError(T_K,
+        "modified RK H₂O EOS is calibrated only for 873.15–1173.15 K"))
     Tc = T_K - 273.15
-    Pb = max(P, 0.0)*1e-5                      # Pa -> bar
+    Pb = P*1e-5                                # Pa -> bar
     return 1e3*(-112.528*Tc^-0.381 + 127.811*Pb^-1.135 + 112.04*Tc^-0.411*Pb^0.033)
 end
 
 """
-    water_gas_partition(P, T_K, ϕ_melt, ep) -> (m_diss, X_g, ρ_g, m_eq)
+    water_gas_partition(P, T_K, ϕ_melt, ep; z_centroid) -> (m_diss, X_g, ρ_g, m_eq)
 
 H₂O speciation + gas density at `P` [Pa], `T_K` [K], `ϕ_melt`. Dissolved water per *magma*
 mass `m_diss = m_eq·ϕ_melt` from the Liu et al. (2005) saturation `m_eq` (per *melt* mass,
-T-dependent, silicic, H₂O-only so P_w=P); exsolved-gas mass fraction `X_g = max(0, m_w −
+T-dependent, silicic, H₂O-only so `P_w=P`); exsolved-gas mass fraction `X_g = max(0, m_w −
 m_diss)` (D&H 2014 eq. 18, water conserved); gas density `ρ_g` from the modified
 Redlich–Kwong EOS ([`rho_gas_RK`](@ref)). Both [`mixture_density`](@ref) and the chamber
 diagnostics on [`EruptionState`](@ref) read this, so the physics lives in one place.
-CO₂ is not modelled (X_co2≡0); there is no CO₂ phase to track.
+CO₂ is not modelled (`X_co2≡0`); there is no CO₂ phase to track. Exsolved gas
+is represented only where `abs(z_centroid) <= ep.z_gas_max`. Deeper chambers return
+`X_g=ϕ_g=ρ_g=0`, keep `m_w` in the condensed phase, and do not evaluate either the
+Liu law or RK EOS.
 """
-function water_gas_partition(P, T_K, ϕ_melt, ep::EruptionParams)
-    Pp     = max(P, 0.0)
+function water_gas_partition(P, T_K, ϕ_melt, ep::EruptionParams; z_centroid=nothing)
+    z_centroid === nothing && throw(ArgumentError(
+        "z_centroid is required so gas physics cannot be applied silently in the lower crust"))
+    all(isfinite, (P, T_K, ϕ_melt, z_centroid)) ||
+        throw(ArgumentError("P, T_K, ϕ_melt, and z_centroid must be finite"))
+    0 <= ϕ_melt <= 1 || throw(DomainError(ϕ_melt, "ϕ_melt must lie in [0, 1]"))
+    0 <= ep.m_w <= 1 || throw(DomainError(ep.m_w, "m_w must lie in [0, 1]"))
+    ep.z_gas_max >= 0 || throw(ArgumentError("z_gas_max must be nonnegative"))
+    ep.m_w == 0 && return 0.0, 0.0, 0.0, NaN
+    if abs(z_centroid) > ep.z_gas_max
+        return ep.m_w, 0.0, 0.0, NaN
+    end
+    Pp = P
     # Liu et al. (2005): coefficients give wt%, the trailing 1e-2 → mass fraction (matches
     # reference exsolve_silicic.m). As the magma crystallizes (ϕ_melt↓) the melt dissolves
     # less, so X_g *rises* — second boiling, D&H's dominant pressurization for small chambers.
@@ -801,22 +1530,28 @@ function water_gas_partition(P, T_K, ϕ_melt, ep::EruptionParams)
     # saturation can't be negative, and dissolved water can't exceed the total m_w — clamp
     # both, so m_diss and X_g stay in [0, m_w] (they are mass fractions).
     m_eq   = max(0.0, 1e-2*((354.94*sqrt(Pm) + 9.623*Pm - 1.5223*Pm^1.5)/T_K + 1.2439e-3*Pm^1.5))
-    ρ_g    = max(rho_gas_RK(Pp, T_K), 1e-6)   # modified Redlich–Kwong (was ideal gas)
+    ρ_g    = rho_gas_RK(Pp, T_K)
+    ρ_g > 0 || throw(DomainError(ρ_g, "RK gas density must be positive"))
     m_diss = min(m_eq*ϕ_melt, ep.m_w)         # dissolved H₂O per magma mass, ≤ total water
     X_g    = ep.m_w - m_diss                  # exsolved-gas mass fraction ∈ [0, m_w]
     return m_diss, X_g, ρ_g, m_eq
 end
 
 """
-    mixture_density(P, T_K, ϕ_melt, ep) -> (ρ, ϕ_g)
+    mixture_density(P, T_K, ϕ_melt, ep; z_centroid) -> (ρ, ϕ_g)
 
 Three-phase (melt + crystal + exsolved gas) mixture density [kg/m³] and gas volume
 fraction at pressure `P` [Pa], temperature `T_K` [K] and melt fraction `ϕ_melt`. The H₂O
 speciation and gas density come from [`water_gas_partition`](@ref).
 """
-function mixture_density(P, T_K, ϕ_melt, ep::EruptionParams)
-    _, Xg, ρ_g, _ = water_gas_partition(P, T_K, ϕ_melt, ep)
+function mixture_density(P, T_K, ϕ_melt, ep::EruptionParams; z_centroid=nothing)
     ρ_c   = ϕ_melt*ep.ρ_melt + (1-ϕ_melt)*ep.ρ_x   # condensed (melt+crystal) density
+    z_centroid === nothing && throw(ArgumentError(
+        "z_centroid is required so gas physics cannot be applied silently in the lower crust"))
+    if abs(z_centroid) > ep.z_gas_max
+        return ρ_c, 0.0
+    end
+    _, Xg, ρ_g, _ = water_gas_partition(P, T_K, ϕ_melt, ep; z_centroid)
     Vg    = Xg/ρ_g
     Vc    = (1-Xg)/ρ_c
     ρ     = 1.0/(Vg + Vc)
@@ -835,21 +1570,29 @@ its own, removing the free GUI knob. This is the geometry-free tier; the full sp
 radial integral (D&H A.18–A.21) is deferred (1-D-Cartesian makes it only *effective*).
 """
 function wall_relaxation_viscosity(ep::EruptionParams, T_wall_K)
+    isfinite(T_wall_K) && T_wall_K > 0 ||
+        throw(ArgumentError("T_wall_K must be finite and positive"))
     return clamp(ep.A_visc*exp(ep.G_act/(ep.B_gas*T_wall_K)), 1e17, 1e24)
 end
 
 """
     eruptible_mush(ϕ, z; ϕ_erupt=0.5) -> (ind, V_e, z_centroid)
 
-Indices of the eruptible (mobile-mush) cells `ϕ ≥ ϕ_erupt`, the eruptible thickness
-`V_e = Σ ϕ·dz` [m] (melt-weighted, per unit area), and the melt-weighted centroid depth.
+Indices of the largest contiguous mobile-mush chamber (`ϕ ≥ ϕ_erupt`), its bulk
+thickness `V_e` [m per unit area], and its melt-weighted centroid depth. Disconnected
+melt lenses are independent chambers and are never combined into one pressure reservoir.
 """
 function eruptible_mush(ϕ, z; ϕ_erupt=0.5)
-    dz  = abs(z[2] - z[1])
-    ind = findall(ϕ .>= ϕ_erupt)
-    isempty(ind) && return ind, 0.0, 0.0
-    V_e  = sum(ϕ[ind])*dz
-    zc   = sum(ϕ[ind].*z[ind]) / sum(ϕ[ind])
+    length(ϕ) == length(z) || throw(DimensionMismatch("ϕ and z must have equal length"))
+    run = largest_contiguous_range(ϕ .>= ϕ_erupt)
+    run === nothing && return Int[], 0.0, 0.0
+    ind = collect(run)
+    z_lo, z_hi = z[first(run)], z[last(run)]
+    V_e = z_hi - z_lo
+    V_e > 0 || return ind, 0.0, z[first(run)]
+    melt = integrated_content(ϕ, z, z_lo, z_hi)
+    melt > 0 || return ind, 0.0, 0.0
+    zc = integrated_content(ϕ .* z, z, z_lo, z_hi) / melt
     return ind, V_e, zc
 end
 
@@ -874,15 +1617,28 @@ shallow enough), the chamber **drains** the stored volume `V_e·(ΔP-ΔP_relax)�
 back to `ΔP_relax`. Each drain releases exactly the volume its overpressure represents, so
 summed over the step the erupted melt equals the recharge that came in (mass conserved,
 gap §1.2). The total drained melt thickness for the step is returned in `state.h_erupt`
-(0 if the chamber only charged); the caller does the physical band removal with it.
+(0 if the chamber only charged); the caller queues it with [`pending_withdrawal!`](@ref)
+and books an eruption only after the accumulated thickness is physically withdrawn.
 """
 function step_overpressure!(state::EruptionState, ep::EruptionParams,
                             T_mush_K, ϕ_mush, V_e, ȧ, Δt; z_centroid=nothing)
-    ρ, ϕg   = mixture_density(state.P, T_mush_K, ϕ_mush, ep)
+    validate_eruption_params(ep)
+    all(isfinite, (T_mush_K, ϕ_mush, V_e, ȧ, Δt)) ||
+        throw(ArgumentError("chamber-step inputs must be finite"))
+    T_mush_K > 0 || throw(ArgumentError("T_mush_K must be positive"))
+    0 <= ϕ_mush <= 1 || throw(DomainError(ϕ_mush, "ϕ_mush must lie in [0, 1]"))
+    V_e >= 0 || throw(ArgumentError("V_e must be nonnegative"))
+    ȧ >= 0 || throw(ArgumentError("ȧ must be nonnegative"))
+    Δt > 0 || throw(ArgumentError("Δt must be positive"))
+    z_centroid === nothing && throw(ArgumentError(
+        "z_centroid is required to select shallow-gas or deep-condensed physics"))
+    isfinite(z_centroid) || throw(ArgumentError("z_centroid must be finite"))
+    ρ, ϕg   = mixture_density(state.P, T_mush_K, ϕ_mush, ep; z_centroid)
     state.ϕ_g   = ϕg
     state.h_erupt = 0.0
     # H₂O speciation diagnostics (dissolved / exsolved mass fractions, gas density) for tracking
-    state.m_diss, state.X_g, state.ρ_gas, _ = water_gas_partition(state.P, T_mush_K, ϕ_mush, ep)
+    state.m_diss, state.X_g, state.ρ_gas, _ =
+        water_gas_partition(state.P, T_mush_K, ϕ_mush, ep; z_centroid)
     state.η_r = ep.η_r    # record the wall viscosity the caller set (per-model, ep is shared)
     state.ϕ_mush = ϕ_mush # mush-mean melt fraction driving the split (for tracking)
     if !state.init || V_e <= 0
@@ -894,13 +1650,13 @@ function step_overpressure!(state::EruptionState, ep::EruptionParams,
 
     # magma compressibility 1/β_m = (1/ρ)∂ρ/∂P  (finite difference at fixed T,ϕ)
     dP       = max(1e3, 1e-4*max(state.P, 1e5))
-    ρp, _    = mixture_density(state.P + dP, T_mush_K, ϕ_mush, ep)
+    ρp, _    = mixture_density(state.P + dP, T_mush_K, ϕ_mush, ep; z_centroid)
     inv_βm   = (ρp - ρ)/(ρ*dP)
     state.inv_βm = inv_βm
 
     # thermodynamic source: -(1/ρ) dρ/dt at fixed P (T & ϕ change only). Held over the
     # sub-steps (T, ϕ only change on the thermal Δt).
-    ρ_old, _ = mixture_density(state.P, state.T_prev, state.ϕ_prev, ep)
+    ρ_old, _ = mixture_density(state.P, state.T_prev, state.ϕ_prev, ep; z_centroid)
     dρdt_TP  = (ρ - ρ_old)/Δt
     Ṁ_in     = ȧ*ep.ρ_melt
     S        = Ṁ_in/(ρ*V_e) - dρdt_TP/ρ
@@ -976,99 +1732,6 @@ function overpressure_erupts(state::EruptionState, ep::EruptionParams, z_centroi
     (state.P - state.P_lith) >= ep.ΔP_crit &&
         state.ϕ_g < ep.ϕ_g_crit &&
         abs(z_centroid) <= ep.z_erupt_max
-end
-
-"""
-    _overpressure_selfcheck()
-
-Runnable assert-based sanity check for the 3-phase overpressure trigger (no framework).
-"""
-function _overpressure_selfcheck()
-    ep = EruptionParams(ΔP_crit=20e6, ϕ_erupt=0.5, z_erupt_max=15e3)
-
-    # RK gas EOS (item 1): hotter gas lighter, higher-P gas denser, positive over the box
-    @assert rho_gas_RK(1e8, 1123.15) > rho_gas_RK(1e8, 1173.15)   # hotter -> lighter
-    @assert rho_gas_RK(3e8, 1123.15) > rho_gas_RK(1e8, 1123.15)   # higher P -> denser
-    @assert rho_gas_RK(3e8, 1123.15) > 0 && rho_gas_RK(3e7, 1173.15) > 0
-
-    # Liu 2005 solubility (item 4): ~5 wt% at 200 MPa/1200 K, more soluble at higher P
-    meq(Pmpa) = 1e-2*((354.94*sqrt(Pmpa)+9.623*Pmpa-1.5223*Pmpa^1.5)/1200.0 + 1.2439e-3*Pmpa^1.5)
-    @assert 0.03 < meq(200.0) < 0.07
-    @assert meq(400.0) > meq(200.0)
-
-    # wall-T Arrhenius η_r (item 2a): colder wall -> stiffer. Test at realistic country-rock
-    # temps (500-650 K, in-range); at magmatic T the raw value falls below the 1e17 floor.
-    @assert wall_relaxation_viscosity(ep, 500.0) > wall_relaxation_viscosity(ep, 650.0)
-    @assert 1e17 <= wall_relaxation_viscosity(ep, 500.0) <= 1e24
-    @assert wall_relaxation_viscosity(ep, 1200.0) == 1e17    # hot wall clamps to the floor
-
-    # mixture density: higher P dissolves more water -> less gas -> denser, ϕ_g ∈ [0,1]
-    ρlo, glo = mixture_density(5e6,  1200.0, 0.7, ep)
-    ρhi, ghi = mixture_density(3e8,  1200.0, 0.7, ep)
-    @assert 0 <= glo <= 1 && 0 <= ghi <= 1
-    @assert ρhi > ρlo && ghi < glo
-
-    # second boiling (D&H's dominant trigger): at fixed P,T, crystallizing the magma
-    # (ϕ_melt↓) must EXSOLVE gas (ϕ_g↑), because the shrinking melt dissolves less water
-    _, g_wet = mixture_density(1e8, 1200.0, 0.8, ep)   # crystal-poor
-    _, g_dry = mixture_density(1e8, 1200.0, 0.4, ep)   # crystal-rich
-    @assert g_dry > g_wet
-
-    z = collect(-30e3:100.0:0.0)
-    ϕ = [(-15e3 <= zi <= -12e3) ? 0.8 : 0.1 for zi in z]   # a mobile mush at ~13.5 km
-    ind, V_e, zc = eruptible_mush(ϕ, z; ϕ_erupt=ep.ϕ_erupt)
-    @assert !isempty(ind) && V_e > 0 && zc < 0
-
-    st = EruptionState(); init_eruption!(st, ep, zc)
-    @assert st.P ≈ st.P_lith
-    @assert !overpressure_erupts(st, ep, zc)          # at lithostatic: no eruption
-
-    # pressurize with recharge and near-rigid, slowly-relaxing walls; disable draining
-    # (unreachable ΔP_crit) to test that recharge alone builds overpressure
-    ep.η_r = 1e30
-    ep.ΔP_crit = 1e15
-    for _ in 1:200
-        step_overpressure!(st, ep, 1200.0+273.15, 0.8, V_e, 1e-9, 1e10)
-    end
-    @assert st.P - st.P_lith > 0 && st.h_erupt == 0.0  # recharge builds ΔP, no eruption
-
-    # with a reachable threshold the chamber drains, and the erupted melt over a run is
-    # mass-conserving: it can't exceed the melt recharged (this over-counted before)
-    ep.ΔP_crit = 20e6
-    st2 = EruptionState(); init_eruption!(st2, ep, zc)
-    ȧ_t, Δt_t, nstep = 1e-9, 1e11, 60
-    step_overpressure!(st2, ep, 1200.0+273.15, 0.8, V_e, ȧ_t, Δt_t)   # init call
-    erupted = 0.0
-    for _ in 1:nstep
-        step_overpressure!(st2, ep, 1200.0+273.15, 0.8, V_e, ȧ_t, Δt_t; z_centroid=zc)
-        erupted += st2.h_erupt
-    end
-    recharge = ȧ_t*Δt_t*nstep                          # total melt recharged [m]
-    @assert erupted > 0                                # it erupts
-    @assert erupted <= 1.05*recharge                   # never more than came in (conserved)
-
-    # depth cutoff: too-deep chamber never drains even when over-pressured
-    st2.P = st2.P_lith + 5*ep.ΔP_crit
-    step_overpressure!(st2, ep, 1200.0+273.15, 0.8, V_e, ȧ_t, Δt_t; z_centroid=-30e3)
-    @assert st2.h_erupt == 0.0                          # 30 km > z_erupt_max (15 km): no drain
-
-    # depth cutoff: same overpressure, chamber too deep -> no eruption
-    ep_deep = EruptionParams(ΔP_crit=20e6, z_erupt_max=10e3)   # zc ≈ -13.5 km > 10 km
-    st.P = st.P_lith + 10*ep.ΔP_crit
-    @assert overpressure_erupts(st, ep, zc)            # shallow enough (15 km max)
-    @assert !overpressure_erupts(st, ep_deep, zc)      # too deep (10 km max)
-
-    # lithostatic reference tracks a migrating chamber without jumping ΔP
-    st_m = EruptionState()
-    update_lithostatic!(st_m, ep, -13e3)
-    @assert st_m.P ≈ st_m.P_lith                       # first call initialises at lithostatic
-    st_m.P += 5e6                                       # build some overpressure
-    update_lithostatic!(st_m, ep, -14e3)               # chamber centroid deepens
-    @assert st_m.P_lith ≈ ep.ρ_crust*ep.g*14e3
-    @assert st_m.P - st_m.P_lith ≈ 5e6                 # ΔP continuous across the shift
-
-    println("overpressure trigger self-check passed")
-    return true
 end
 
 """
@@ -1189,21 +1852,25 @@ end
     advect_tracers_sill!(tracers, Sill_z0, Sill_thick; SillType=:elastic)
 
 Displace each tracer's depth `tracer.z` by the same per-point displacement law that
-`insert_sill` applies to the temperature/rock fields when a sill of thickness
-`Sill_thick` [m] is emplaced at `Sill_z0` [m]: zero inside the sill, and
-`±crack_perp_displacement` outside it (or `±Sill_thick` for `SillType=:constant`).
+`insert_sill` applies to the temperature/rock fields when a sill of full thickness
+`Sill_thick` [m] is emplaced at `Sill_z0` [m]: zero inside the sill, and each wall
+moves by at most `Sill_thick/2`.
 Use this for the discrete-sill path; `compute_Q_magma!`/`advect_w!` does not displace
 the column this way and should use `advect_tracers!` instead.
 """
 function advect_tracers_sill!(tracers, Sill_z0, Sill_thick; SillType=:elastic, r=5e3)
+    Sill_thick > 0 || throw(ArgumentError("Sill_thick must be positive"))
+    SillType in (:constant, :elastic) ||
+        throw(ArgumentError("SillType must be :constant or :elastic"))
+    r > 0 || throw(ArgumentError("r must be positive"))
     for tracer in tracers
         z_shift = tracer.z - Sill_z0
         if abs(z_shift) <= Sill_thick/2
             continue   # inside the sill: no host-rock displacement to apply
         elseif SillType == :constant
-            tracer.z += z_shift > 0 ? Sill_thick : -Sill_thick
+            tracer.z += z_shift > 0 ? Sill_thick/2 : -Sill_thick/2
         elseif SillType == :elastic
-            d = crack_perp_displacement(z_shift, Sill_thick; r=r)
+            d = crack_perp_displacement(z_shift, Sill_thick/2; r=r)
             tracer.z += z_shift > 0 ? d : -d
         end
     end
