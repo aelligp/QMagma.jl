@@ -1,0 +1,18 @@
+# Example Unzen magma-accretion scenario for QMagma.jl.
+# Time is model time in kyr: t = 0 corresponds to 350 ka before present and t = 350 to present.
+# Flux is an equivalent vertical accretion rate [m/yr], not an eruption rate.
+# The U-Th zircon compilation constrains the timing envelope but not the absolute flux.
+# This scenario delivers 425.5 m of equivalent magma thickness over 350 kyr.
+# No depth column is supplied because the workbook contains no emplacement-depth constraint;
+# use the GUI's Top inj. / Bottom inj. controls (e.g., 10–20 km) for that assumption.
+time_kyr,flux_m_per_yr
+0,0.0
+20,0.0001
+50,0.0002
+100,0.0003
+150,0.0006
+200,0.0012
+250,0.0015
+300,0.0030
+340,0.0040
+350,0.0

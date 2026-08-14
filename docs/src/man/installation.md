@@ -14,18 +14,23 @@ using Pkg
 Pkg.develop(url="https://github.com/aelligp/QMagma.jl")
 ```
 
-The package requires Julia 1.10 or newer. Loading it takes a while the first time, since
-GLMakie is a regular dependency and must be precompiled:
+The package requires Julia 1.10 or newer.
 
 ```julia
 using QMagma
 ```
 
-!!! info "The GUI needs no extra packages"
-    GLMakie is a direct dependency rather than a package extension, so
-    [`sill_intrusion_1D`](@ref) is available as soon as `QMagma` is loaded. This also
-    means a working OpenGL context is needed to load the package. On a headless machine,
-    run Julia under `xvfb-run`.
+!!! info "The GUI lives in a package extension"
+    GLMakie is a weak dependency. [`sill_intrusion_1D`](@ref) throws until `GLMakie` is
+    loaded as well:
+
+    ```julia
+    using QMagma, GLMakie
+    ```
+
+    The solver, tracer, and export functions need none of it, so headless runs neither
+    precompile GLMakie nor require an OpenGL context. Loading GLMakie does require one;
+    on a headless machine, run Julia under `xvfb-run`.
 
 ## Threads
 

@@ -1,8 +1,4 @@
-using JLD2
-using WriteVTK
-using GeoParams
-
-export export_thermal_structure, gaussian_thermal_structure, melt_fraction_from_temperature
+# Writing model output to JLD2 and VTK, including Gaussian 2D/3D expansion of 1D profiles.
 
 """
     gaussian_thermal_structure(profile, background, x; y=nothing, sigma, center=0)
@@ -11,7 +7,7 @@ Turn a vertical temperature `profile` into a 2D or 3D field by applying a Gaussi
 horizontal taper to its anomaly from `background`. In 2D the distance is `x - center`;
 in 3D it is radial in `x` and `y`, and `center` may be `(x0, y0)`.
 """
-function gaussian_thermal_structure(profile, background, x; y=nothing, sigma, center=0)
+function gaussian_thermal_structure(profile, background, x; y = nothing, sigma, center = 0)
     length(profile) == length(background) ||
         throw(DimensionMismatch("profile and background must have equal length"))
     sigma > 0 || throw(ArgumentError("sigma must be positive"))
@@ -25,7 +21,7 @@ function gaussian_thermal_structure(profile, background, x; y=nothing, sigma, ce
     length(center_xy) == 2 || throw(ArgumentError("3D center must be a number or (x0, y0)"))
     weight = @. exp(-((x - center_xy[1])^2 + (y' - center_xy[2])^2) / (2sigma^2))
     return reshape(background, 1, 1, :) .+
-           reshape(weight, length(x), length(y), 1) .* reshape(anomaly, 1, 1, :)
+        reshape(weight, length(x), length(y), 1) .* reshape(anomaly, 1, 1, :)
 end
 
 """
@@ -62,18 +58,20 @@ export_thermal_structure("run_2d", z; x, fields=(temperature=T2,))
 export_thermal_structure("run_Qmagma_2d", z; x, fields=(temperature=T2_Q,))
 ```
 """
-function export_thermal_structure(filename, z; x=nothing, y=nothing, fields,
-                                  formats=(:jld2, :vtk))
+function export_thermal_structure(
+        filename, z; x = nothing, y = nothing, fields,
+        formats = (:jld2, :vtk)
+    )
     y === nothing || x !== nothing || throw(ArgumentError("y requires x"))
-    coordinates = x === nothing ? (z=z,) :
-                  y === nothing ? (x=x, z=z) : (x=x, y=y, z=z)
+    coordinates = x === nothing ? (z = z,) :
+        y === nothing ? (x = x, z = z) : (x = x, y = y, z = z)
     for (name, coordinate) in pairs(coordinates)
         isempty(coordinate) && throw(ArgumentError("$name must not be empty"))
         all(diff(coordinate) .> 0) || throw(ArgumentError("$name must be strictly ascending"))
     end
 
     dimensions = Tuple(length(coordinate) for coordinate in values(coordinates))
-    expanded = Dict{Symbol,Any}()
+    expanded = Dict{Symbol, Any}()
     for (name, field) in pairs(fields)
         field isa AbstractArray || throw(ArgumentError("field $name must be an array"))
         size(field) == dimensions ||
@@ -90,7 +88,7 @@ function export_thermal_structure(filename, z; x=nothing, y=nothing, fields,
     written = String[]
 
     if :jld2 in requested
-        payload = Dict{Symbol,Any}(:dimensionality => length(dimensions))
+        payload = Dict{Symbol, Any}(:dimensionality => length(dimensions))
         merge!(payload, Dict(pairs(coordinates)), expanded)
         path = basename * ".jld2"
         jldsave(path; payload...)
@@ -102,11 +100,13 @@ function export_thermal_structure(filename, z; x=nothing, y=nothing, fields,
             ([zero(coordinate_type)], coordinate_type.(z)) :
             Tuple(coordinate_type.(coordinate) for coordinate in values(coordinates))
         vtk_fields = x === nothing ? Dict(name => reshape(field, 1, length(z)) for (name, field) in expanded) : expanded
-        append!(written, vtk_grid(basename, vtk_coordinates...) do vtk
-            for (name, field) in vtk_fields
-                vtk[string(name)] = field
+        append!(
+            written, vtk_grid(basename, vtk_coordinates...) do vtk
+                for (name, field) in vtk_fields
+                    vtk[string(name)] = field
+                end
             end
-        end)
+        )
     end
     return written
 end

@@ -2,6 +2,7 @@
 
 ```julia
 using QMagma
+using GLMakie
 
 sill_intrusion_1D()
 ```
@@ -47,20 +48,27 @@ SIMULATION**.
 | `Sill T [ᵒC]` | 1200 | Injection temperature |
 | `Sill thick [m]` | 100 | Full aperture of each discrete sill; variable flux changes event frequency |
 | Flux-history menu | `Constant` | `Constant`, `Linear ramp`, `Pulse`, or `CSV table` |
-| `Base flux [m/yr]` | 0.1 | Constant flux, ramp start, or pulse background |
+| `Base flux [m/yr]` | 0.1 | Constant flux or ramp start; unused by a pulse |
 | `Peak/end flux [m/yr]` | 0.2 | Ramp endpoint or pulse flux |
-| `Flux start/end [kyr]` | 50 / 100 | Ramp transition or pulse window |
-| `Flux CSV path` | `flux.csv` | Two-column table used in `CSV table` mode |
+| `Flux start/end [kyr]` | 50 / 100 | Injection episode; flux is zero outside it |
+| `Flux CSV path` | `examples/flux_history.csv` | Example table used in `CSV table` mode |
 | `Top inj. [km]` | 10 | Top of the injection window |
 | `Bottom inj. [km]` | 20 | Bottom of the injection window |
 
-Both emplacement styles use the same history. Ramp flux is linear between its start and
-end times and constant outside them. Pulse flux equals the peak inside `[start,end)` and
-the base outside. CSV tables contain `time_kyr,flux_m_per_yr`, may include one header row,
-and are linearly interpolated with flat extrapolation. Flux is integrated exactly over
-each thermal step, so a pulse is not lost when a timestep crosses both pulse edges.
+Both emplacement styles use the same history. Ramp and pulse are *episodes*: `Flux
+start/end` bound the whole injection, and the flux is zero outside them, so sills stop
+arriving at `Flux end`. Ramp flux climbs linearly from the base to the peak across that
+window; pulse flux equals the peak throughout it and has no base, so its box is disabled.
+Use a CSV table for a steady background flux with a surge on top. CSV tables contain
+`time_kyr,flux_m_per_yr,depth_km` and may include one header row. Depth is positive downward;
+when present it overrides the GUI injection interval. The discrete branch centers each sill
+at the interpolated depth; the Q_magma branch centers a source band one sill aperture wide at
+the same depth. A two-column CSV falls back to `Top inj.` / `Bottom inj.`. Flux and depth use
+linear interpolation with flat extrapolation, and flux is integrated exactly over each
+thermal step, so a pulse is not lost when a timestep crosses both pulse edges.
 The realized step-mean history is exported as `last_run_out[:flux_m_per_yr]` alongside
-`time_vec`; the selected mode and its parameters are exported under `flux_*` keys.
+`time_vec`; the selected mode and its parameters are exported under `flux_*` keys, including
+`flux_table_depth_km`.
 
 ### Material physics
 
@@ -78,22 +86,24 @@ side from identical initial conditions and identical `ȧ(t)`. See
 
 ### Eruption
 
-The trigger menu selects `None`, `Melt thickness`, `Elastic box model`, or `D&H 3-phase`.
-The collapse menu independently selects `Hybrid`, `Caldera`, or `Elastic`. Controls that do
-not apply to the selected trigger are disabled.
+The trigger menu selects `None` or `D&H 3-phase`. The collapse menu independently selects
+`Hybrid` or `Caldera`. With `None` selected the eruption controls are disabled; they all
+apply to the 3-phase chamber together.
 
-| Control | Default | Used by |
+| Control | Default | Role |
 |---|---|---|
-| `Threshold [m]` | 500 | Melt-thickness trigger |
-| `Sill radius [km]` | 5 | All active triggers; sets chamber area `πR²` and erupted volume |
-| `ΔP crit [MPa]` | 20 | Elastic box model, D&H |
-| `μ shear [GPa]` | 10 | Elastic box model, D&H |
-| `β magma [1/GPa]` | 0.1 | Elastic box model, D&H |
-| `Max erupt depth [km]` | 15 | All active triggers |
+| `Sill radius [km]` | 5 | Chamber area `πR²`, and so the reported erupted volume |
+| `ΔP crit [MPa]` | 20 | Roof-failure overpressure |
+| `μ shear [GPa]` | 10 | Host-rock shear modulus; sets `1/β_r = 3/(4με)`, `ε = min(V/2R_sill, 1)` |
+| `H₂O [wt%]` | 0 | Total magmatic water; nonzero values activate volatile partitioning and gas density |
+| `Min. chamber melt [m]` | 500 | Melt content `∫ϕ dz` a connected region must hold to count as a chamber |
 
-The wall relaxation viscosity has no widget: it is computed from the country-rock
-temperature each step ([`QMagma.wall_relaxation_viscosity`](@ref)). See
-[Eruptions](eruptions.md).
+The melting menu also selects the H₂O saturation law — basalt takes the mafic law, rhyolite
+and assimilation the silicic Liu et al. (2005) law — so the two cannot be mismatched.
+
+The shell relaxation viscosity has no widget: it is computed each step from the mush
+temperature and the geotherm at the chamber's depth
+([`QMagma.crustal_relaxation_viscosity`](@ref)). See [Eruptions](eruptions.md).
 
 ### Output
 
@@ -129,8 +139,9 @@ Common keys in `last_run_out` include:
   `:collapse_event_time_vec`, `:collapse_event_thickness_vec`, and
   `:surface_subsidence_vec` for the discrete branch
 - for a D&H run, `:chamber_dP_vec`, `:chamber_mdiss_vec`, `:chamber_Xg_vec`,
-  `:chamber_phig_vec`, `:chamber_rhogas_vec`, `:chamber_etar_vec`, `:chamber_phimush_vec`
-  against `:time_vec`
+  `:chamber_phig_vec`, `:chamber_rhogas_vec`, `:chamber_etar_vec`, `:chamber_phimush_vec`,
+  `:chamber_M_vec`, `:chamber_MH2O_vec`, and `:chamber_mass_residual_vec` against
+  `:time_vec`. Chamber masses and residuals are areal quantities in kg/m².
 
 Q\_magma profiles and time series use the same names with `_Qmagma` appended, for example
 `:T_Qmagma`, `:eruption_events_Qmagma`, and `:enthalpy_budget_Qmagma`.

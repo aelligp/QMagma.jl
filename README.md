@@ -24,6 +24,7 @@ Then launch the GLMakie interface:
 
 ```julia
 using QMagma
+using GLMakie   # loads the GUI extension
 sill_intrusion_1D()
 ```
 

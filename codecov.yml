@@ -1,7 +1,7 @@
 # The GLMakie GUI layer is driven by user interaction with a live window and is
 # not exercised by the test suite; coverage tracks the solver and export layers.
 ignore:
-  - "src/ThermalCode_1D_GLMakie.jl"
+  - "ext/QMagmaGLMakieExt/"
 
 coverage:
   status:

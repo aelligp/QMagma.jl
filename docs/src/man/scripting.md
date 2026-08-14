@@ -31,12 +31,17 @@ MatParam = Params.MatParam
 Params.Told .= T
 
 # Both branches share one accretion history. This example ramps from 0.05 to 0.15 m/yr
-# between 50 and 150 kyr; use FluxHistory(:constant; base=0.1/SecYear) for a constant rate.
+# between 50 and 150 kyr and injects nothing outside that window; use
+# FluxHistory(:constant; base=0.1/SecYear) for a rate that never stops.
 Params_Q = deepcopy(Params)
 T_Q      = deepcopy(T)
 ȧ = QMagma.FluxHistory(:ramp;
     base=0.05/SecYear, peak=0.15/SecYear,
     t_start=50e3SecYear, t_end=150e3SecYear)
+
+# Table histories may also prescribe positive-downward depths in meters:
+# ȧ = QMagma.FluxHistory(:table; times, rates, depths)
+# z_center = -QMagma.injection_depth(ȧ, time)
 
 # tridiagonal sparsity pattern of the 1D residual, with the Dirichlet rows decoupled
 J1 = Tridiagonal(ones(N[1]-1), ones(N[1]), ones(N[1]-1))

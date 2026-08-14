@@ -2,17 +2,35 @@
 
 ## Governing equation
 
-QMagma.jl solves the one-dimensional heat equation with latent heat of crystallization and
-a volumetric source term,
+QMagma.jl solves the one-dimensional heat equation with latent heat of crystallization,
+a volumetric source term and a lateral heat-loss term,
 
 ```math
 \rho \left( c_p + L \frac{\partial \phi}{\partial T} \right) \frac{\partial T}{\partial t}
-= \frac{\partial}{\partial z} \left( k \frac{\partial T}{\partial z} \right) + Q ,
+= \frac{\partial}{\partial z} \left( k \frac{\partial T}{\partial z} \right)
+- \frac{2k}{R_\mathrm{lat}^2}\left( T - T_\mathrm{bg} \right) + Q ,
 ```
 
 where ``\phi(T)`` is the melt fraction, ``L`` the latent heat of fusion and ``Q`` the
 magmatic source term. The effective heat capacity ``c_p + L\,\partial\phi/\partial T``
 accounts for latent heat released as magma crystallizes.
+
+## Lateral heat loss
+
+The column is the axis of an axisymmetric body of lateral extent ``R_\mathrm{lat}``, so
+heat also escapes sideways into the crust. The anomaly ``T - T_\mathrm{bg}`` relative to
+the initial geotherm ``T_\mathrm{bg}`` is taken to taper radially as a Gaussian of width
+``R_\mathrm{lat}`` — the same shape [`gaussian_thermal_structure`](@ref) uses to expand a
+profile into 2-D or 3-D — and the radial part of the Laplacian of that Gaussian on the axis
+is ``-2(T - T_\mathrm{bg})/R_\mathrm{lat}^2``. Undisturbed host rock sits at
+``T_\mathrm{bg}``, where the term vanishes; a hot chamber loses heat at a rate set by its
+own width, and the correction dominates vertical conduction once ``R_\mathrm{lat}`` falls
+below the chamber thickness.
+
+`R_lat = Inf` recovers a purely one-dimensional column. The GUI ties it to the chamber
+radius `R_sill`, the same radius that fixes the chamber's compliance and the export
+Gaussian's ``\sigma``. [`QMagma.lateral_loss_energy`](@ref) books the loss in the enthalpy
+budget alongside the top and bottom boundary fluxes.
 
 Material properties ``k``, ``c_p``, ``\rho``, ``\phi`` and ``\partial\phi/\partial T`` come
 from [GeoParams.jl](https://github.com/JuliaGeodynamics/GeoParams.jl) and are functions of
@@ -61,6 +79,9 @@ is equivalent to
 
 with `d` the full sill aperture and ``\Delta t_{\text{inj}}`` an equivalent injection
 interval. Under variable flux, `d` remains fixed and the discrete event frequency changes.
+An optional CSV `depth_km` column supplies a positive-downward, piecewise-linear emplacement
+depth. It centers both the discrete sill and the aperture-wide Q_magma source at the same
+location; without it, the GUI injection interval is used.
 
 ### Discrete sills
 
@@ -143,6 +164,6 @@ injection history as thickness rather than energy, in two accounts:
   emplaced into previously intruded material;
 - the **melt-content budget** (`melt_residual`) compares it against the stored melt but
   deliberately does not label the remainder as crystallization: it also contains host-rock
-  melting, boundary transport, withdrawal discretization, and the booked eruptions.
+  melting, boundary transport, withdrawal discretization, and the realized eruptions.
 
 Both are diagnostics: like the enthalpy budget they measure transport and never correct it.
