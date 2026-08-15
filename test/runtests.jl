@@ -2189,6 +2189,23 @@ end
             @test ui.last_matparam[] === nothing
             @test ext.wire_buttons!(ui) === nothing
             @test ext.wire_simulation!(ui) === nothing
+
+            # Zircon spectra are per injection model: a comparison run must hand the
+            # zircon button both populations, and never mix them up.
+            sill_res, sill_cargo = [QMagma.Tracer(0.0, 0.0, 0.0, 1, [0.0], [900.0])], QMagma.Tracer[]
+            Q_res, Q_cargo = QMagma.Tracer[], [QMagma.Tracer(0.0, 0.0, 0.0, 1, [0.0], [800.0])]
+            run = Dict{Symbol, Any}(
+                :tracers => sill_res, :erupted_tracers => sill_cargo,
+                :tracers_Qmagma => Q_res, :erupted_tracers_Qmagma => Q_cargo,
+            )
+            @test isempty(ext.zircon_populations(Dict{Symbol, Any}()))
+            run[:run_discrete], run[:run_Qmagma] = true, false
+            @test ext.zircon_populations(run) == [("sill", sill_res, sill_cargo)]
+            run[:run_discrete], run[:run_Qmagma] = false, true
+            @test ext.zircon_populations(run) == [("Q_magma", Q_res, Q_cargo)]
+            run[:run_discrete], run[:run_Qmagma] = true, true
+            @test ext.zircon_populations(run) ==
+                [("sill", sill_res, sill_cargo), ("Q_magma", Q_res, Q_cargo)]
         end
     end
 

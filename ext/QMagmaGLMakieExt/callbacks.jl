@@ -36,6 +36,23 @@ function _zircon_density!(ax, ages_ka, ub, color, alpha, label)
 end
 
 """
+    zircon_populations(last_run) -> Vector{Tuple{String, Vector{Tracer}, Vector{Tracer}}}
+
+`(label, reservoir tracers, erupted cargo)` for each injection model of a finished run.
+The two models carry separate tracer populations and so have separate zircon spectra;
+the discrete branch comes first, matching the primary-branch convention of `last_run`.
+Empty before the first run.
+"""
+function zircon_populations(last_run)
+    pops = Tuple{String, Vector{Tracer}, Vector{Tracer}}[]
+    get(last_run, :run_discrete, false) &&
+        push!(pops, ("sill", last_run[:tracers], last_run[:erupted_tracers]))
+    get(last_run, :run_Qmagma, false) &&
+        push!(pops, ("Q_magma", last_run[:tracers_Qmagma], last_run[:erupted_tracers_Qmagma]))
+    return pops
+end
+
+"""
     wire_buttons!(ui)
 
 Attach the screenshot, data-export, stop and zircon-age handlers to the buttons of the
@@ -131,65 +148,87 @@ function wire_buttons!(ui)
     end
 
     on(but_zircon.clicks) do n
+        # Snapshot: the worker runs while the GUI can start the next simulation.
+        pops = [(label, copy(reservoir), copy(cargo)) for (label, reservoir, cargo) in zircon_populations(last_run)]
+
         if sim_running[]
             println("Simulation is still finishing up - wait until it stops completely before computing zircon ages")
         elseif zircon_running[]
             println("Zircon ages are already being computed")
-        elseif isempty(QMagma.tracers_out)
+        elseif all(isempty(reservoir) for (_, reservoir, _) in pops)
             println("No tracer data yet - run the simulation first")
         else
             zircon_running[] = true
-            reservoir = copy(QMagma.tracers_out)
-            cargo = copy(QMagma.erupted_tracers_out)
             Threads.nthreads() == 1 && println("Zircon calculation uses the only Julia thread; restart with `julia -t auto` to keep the GUI responsive")
-            println("Computing zircon ages for $(length(reservoir)) reservoir tracers + $(length(cargo)) erupted-cargo tracers on $(Threads.nthreads()) thread(s)...")
+            println(
+                "Computing zircon ages on $(Threads.nthreads()) thread(s) for " *
+                    join(("$label: $(length(reservoir)) reservoir + $(length(cargo)) erupted-cargo tracers" for (label, reservoir, cargo) in pops), ", ")
+            )
             worker = Threads.@spawn begin
-                t_ref = maximum((tr.time_vec[end] for tr in reservoir if length(tr.time_vec) >= 2); init = 0.0)
-                zircon_result = compute_zircon_ages(reservoir; nx = 50, t_ref_Myr = t_ref)
-                cargo_result = isempty(cargo) ? nothing : compute_zircon_ages(cargo; nx = 50, t_ref_Myr = t_ref)
-                return zircon_result, cargo_result
+                # One clock for every population, so the two models' spectra and their
+                # erupted cargoes are all directly comparable.
+                t_ref = maximum(
+                    (
+                        tr.time_vec[end] for (_, reservoir, _) in pops
+                            for tr in reservoir if length(tr.time_vec) >= 2
+                    ); init = 0.0
+                )
+                map(pops) do (label, reservoir, cargo)
+                    res = compute_zircon_ages(reservoir; nx = 50, t_ref_Myr = t_ref)
+                    car = isempty(cargo) ? Float64[] :
+                        compute_zircon_ages(cargo; nx = 50, t_ref_Myr = t_ref).age_years
+                    return (; label, res.age_years, res.zircon_radius_um, cargo_years = car, n_cargo = length(cargo))
+                end
             end
 
             # Keep all GLMakie calls on the GUI task. `@async` alone is cooperative and
             # cannot make CPU-bound work responsive; it only waits for the worker here.
             @async try
-                zircon_result, cargo_result = fetch(worker)
-                if !isempty(zircon_result.age_years)
-                    last_run[:zircon_age_years] = zircon_result.age_years
-                    last_run[:zircon_radius_um] = zircon_result.zircon_radius_um
-                    cargo_result !== nothing && (last_run[:zircon_age_years_erupted] = cargo_result.age_years)
+                results = fetch(worker)
+                # Model colors; within a model, the resident reservoir and the erupted
+                # cargo get the cool/warm member of the pair.
+                palette = ((:steelblue, :firebrick), (:seagreen, :darkorange))
+                series = NamedTuple[]
+                for (i, r) in pairs(results)
+                    # Generic keys carry the first (discrete-primary) branch, matching the
+                    # rest of `last_run`; the second branch is always Q_magma.
+                    sfx = i == 1 ? "" : "_Qmagma"
+                    isempty(r.age_years) && continue
+                    last_run[Symbol(:zircon_age_years, sfx)] = r.age_years
+                    last_run[Symbol(:zircon_radius_um, sfx)] = r.zircon_radius_um
+                    isempty(r.cargo_years) ||
+                        (last_run[Symbol(:zircon_age_years_erupted, sfx)] = r.cargo_years)
 
-                    age_ka = zircon_result.age_years ./ 1.0e3
-                    n = length(age_ka)
-                    cargo_ka = (cargo_result === nothing || isempty(cargo_result.age_years)) ? Float64[] : cargo_result.age_years ./ 1.0e3
-                    ne = length(cargo_ka)
+                    cool, warm = palette[mod1(i, length(palette))]
+                    push!(series, (; label = "$(r.label) reservoir", ka = r.age_years ./ 1.0e3, color = cool, alpha = 0.4))
+                    isempty(r.cargo_years) ||
+                        push!(series, (; label = "$(r.label) erupted", ka = r.cargo_years ./ 1.0e3, color = warm, alpha = 0.3))
+                    r.n_cargo > 0 &&
+                        println("$(r.label) erupted zircon cargo: $(length(r.cargo_years)) datable ages (of $(r.n_cargo) extracted tracers)")
+                end
+
+                if !isempty(series)
+                    ub = maximum(maximum(s.ka) for s in series) * 1.05
 
                     zircon_fig = Figure(size = (1100, 400))
                     zircon_ax = Axis(
                         zircon_fig[1, 1], xlabel = "Zircon age [ka]", ylabel = "Density",
-                        title = "Zircon age distribution (reservoir n=$n, erupted n=$ne)"
+                        title = "Zircon age distribution"
                     )
-                    ub = maximum(vcat(age_ka, cargo_ka)) * 1.05
-                    n > 1 && _zircon_density!(zircon_ax, age_ka, ub, :steelblue, 0.4, "reservoir (n=$n)")
-                    if ne > 1
-                        _zircon_density!(zircon_ax, cargo_ka, ub, :firebrick, 0.3, "erupted (n=$ne)")
-                    end
-                    xlims!(zircon_ax, 0, ub)
-                    axislegend(zircon_ax)
-
-                    age_sorted = sort(age_ka)
-                    cum_prob = (1:n) ./ n .* 100
                     cdf_ax = Axis(
                         zircon_fig[1, 2], xlabel = "Zircon age [ka]", ylabel = "Cumulative probability [%]",
                         title = "Zircon age spectrum (ranked order)"
                     )
-                    stairs!(cdf_ax, age_sorted, cum_prob; step = :post, color = :steelblue, label = "reservoir (n=$n)")
-                    if ne > 1
-                        cargo_sorted = sort(cargo_ka)
-                        stairs!(cdf_ax, cargo_sorted, (1:ne) ./ ne .* 100; step = :post, color = :firebrick, label = "erupted (n=$ne)")
+                    for s in series
+                        ns = length(s.ka)
+                        label = "$(s.label) (n=$ns)"
+                        ns > 1 && _zircon_density!(zircon_ax, s.ka, ub, s.color, s.alpha, label)
+                        stairs!(cdf_ax, sort(s.ka), (1:ns) ./ ns .* 100; step = :post, color = s.color, label = label)
                     end
+                    xlims!(zircon_ax, 0, ub)
                     ylims!(cdf_ax, 0, 100)
-                    ne > 1 && axislegend(cdf_ax, position = :rb)
+                    any(length(s.ka) > 1 for s in series) && axislegend(zircon_ax)
+                    axislegend(cdf_ax, position = :rb)
 
                     # display in its own window first: saving an undisplayed Figure
                     # directly can make GLMakie reuse/reconfigure the main GUI's existing
@@ -199,7 +238,6 @@ function wire_buttons!(ui)
                     zircon_name = filename[2].stored_string.val * "_zircon_ages.png"
                     save(zircon_name, zircon_fig)
                     println("Saved zircon age density + cumulative probability plot to $(joinpath(pwd(), zircon_name))")
-                    ne > 0 && println("Erupted zircon cargo: $ne datable ages (of $(length(cargo)) extracted tracers)")
                 else
                     println("No tracers had enough recorded history to compute zircon ages; skipped zircon age plot")
                 end

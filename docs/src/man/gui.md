@@ -113,8 +113,10 @@ model - the 1D profiles and Gaussian 2D/3D temperature fields with σ equal to t
 radius and a lateral extent of ±3σ (see [Headless runs and export](scripting.md)). The
 `Record movie` toggle records the run to a video file. **COMPUTE ZIRCON AGES** runs
 [`compute_zircon_ages`](@ref) on the tracers of the finished run and plots the age
-spectra of the reservoir and of the erupted cargo (see
-[Tracers and zircon ages](tracers.md)).
+spectra of the reservoir and of the erupted cargo, one pair per active injection model
+(see [Tracers and zircon ages](tracers.md)). Ages are written back to `last_run_out` under
+`:zircon_age_years`, `:zircon_radius_um`, and `:zircon_age_years_erupted`, with the
+`_Qmagma` suffix for the Q\_magma branch of a comparison run.
 
 ## Results in the REPL
 

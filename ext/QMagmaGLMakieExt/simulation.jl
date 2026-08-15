@@ -742,6 +742,10 @@ function wire_simulation!(ui)
             # end of a run, so it is exported rather than left implicit in A_inj.
             last_run[:delivered_thickness] = A_inj
             last_run[:pending_thickness] = mod(A_inj, Sillthick)
+            # Which branches ran: the generic keys below alias one of them, so consumers
+            # need these to tell a comparison run from a single-model run.
+            last_run[:run_discrete] = run_discrete
+            last_run[:run_Qmagma] = run_Qmagma
             if run_discrete
                 last_run[:T] = T
                 last_run[:phi] = Params.ϕ
