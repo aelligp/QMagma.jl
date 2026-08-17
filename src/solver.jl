@@ -8,18 +8,19 @@
 
 Create initial model setup.
 
-The material parameters are assembled here from the individual constitutive laws, so every
-entry point (GUI, scripts, tests) shares one definition of the host-rock properties. `ρ`
-[kg/m³] is the host-rock *thermal* density, the one that enters heat storage and
-conduction; it is a separate role from the melt, crystal and lithostatic densities on
-[`EruptionParams`](@ref), which [`check_density_consistency`](@ref) keeps in step. Pass a
-ready-made `MatParam` tuple only to reuse one built elsewhere; combining it with any
-component keyword is an error because those components would otherwise be ignored.
+`ρ` [kg/m³] is the host-rock *thermal* density, the one entering heat storage and
+conduction. It is a separate role from the melt, crystal and lithostatic densities on
+[`EruptionParams`](@ref), which [`check_density_consistency`](@ref) keeps in step.
 
-`R_lat` [m] is the lateral radius of the body whose axis the column represents; it closes
-the radial part of the 3-D Laplacian, so heat is also lost sideways (see [`Res!`](@ref)).
-`Inf` leaves the model purely 1-D. The initial geotherm is kept as `Params.T_bg`, the
-far-field temperature that lateral loss relaxes towards.
+Pass `MatParam` only to reuse a tuple built elsewhere; combining it with any component
+keyword is an error.
+
+`R_lat` [m] is the lateral radius of the body whose axis the column represents, closing the
+radial part of the 3-D Laplacian so heat is also lost sideways (see [`Res!`](@ref)). `Inf`
+leaves the model purely 1-D.
+
+The initial geotherm is kept as `Params.T_bg`, the far-field temperature lateral loss
+relaxes towards.
 """
 function init_model(;
         nz = 101, L = 40.0e3, Geotherm = 0, Ttop = 400.0, Tbot = 0.0, Δt = 1.0e3 * SecYear,
@@ -80,12 +81,12 @@ end
 """
     update_properties!(Params, MatParam)
 
-Evaluate all temperature-dependent material properties (k, Cp, ρ, dϕ/dT, ϕ, latent
-heat) from `Params.Told` and cache them in `Params`. These depend only on the *old*
-temperature, not on the Newton unknown `T`, so the residual is linear in `T` and the
-properties stay constant across the solve. Call this once per timestep (done in
-`nonlinear_solution`) instead of recomputing the (expensive) GeoParams evaluations on
-every residual / Jacobian / line-search evaluation.
+Evaluate the temperature-dependent material properties (k, Cp, ρ, dϕ/dT, ϕ, latent heat)
+from `Params.Told` and cache them in `Params`.
+
+They are frozen at the *old* temperature, not the Newton unknown `T`, so the residual is
+linear in `T`. Called once per timestep by `nonlinear_solution`, not per residual, Jacobian
+or line-search evaluation.
 """
 function update_properties!(Params, MatParam)
     args = (T = Params.Told .+ 273.15,)
@@ -96,9 +97,9 @@ function update_properties!(Params, MatParam)
     compute_dϕdT!(Params.dϕdT, MatParam, Params.Phases, args)
     compute_meltfraction!(Params.ϕ, MatParam, Params.Phases, args)
     compute_latent_heat!(Params.Hl, Params.MatParam, Params.Phases, args)
-    # 2k/R² at the interior nodes: the radial Laplacian of the lateral Gaussian on the axis
-    # (see Res!). k lives on cell centres, so 2*av(k) is its node-centred value times two.
-    Params.Hlat[2:(end - 1)] .= 2 .* av(Params.k) ./ Params.R_lat^2
+    # Lateral loss at the interior nodes. k lives on cell centres, so av(k) is its
+    # node-centred value.
+    Params.Hlat[2:(end - 1)] .= lateral_loss_coefficient.(av(Params.k), Params.R_lat)
     return Params
 end
 
@@ -109,11 +110,14 @@ Residual of the backward-Euler heat equation on the column,
 
 `ρ(Cp + Hₗ∂ϕ/∂T) ∂T/∂t = ∂/∂z(k ∂T/∂z) - Hlat(T - T_bg) + Q`.
 
-`Hlat(T - T_bg)` is the lateral loss the third dimension carries away. The column is the
-axis of an axisymmetric body whose anomaly `T - T_bg` tapers laterally as a Gaussian of
-width `Params.R_lat` — the same shape [`gaussian_thermal_structure`](@ref) exports — and
-that Gaussian's radial Laplacian on the axis is `-2(T - T_bg)/R_lat²`. With `R_lat = Inf`
-the coefficient is zero and the model is purely 1-D.
+`Hlat(T - T_bg)` is the loss the third dimension carries away: the column is the axis of an
+axisymmetric body of radius `Params.R_lat` whose anomaly tapers as
+[`lateral_profile`](@ref), and `Hlat` is `-k` times that profile's radial Laplacian on the
+axis ([`lateral_loss_coefficient`](@ref)). `R_lat = Inf` is purely 1-D.
+
+The coefficient sees only that curvature, so any profile `1 - r²/(2R²) + O(r⁴)` gives the
+same `2k/R²` and this balance does not by itself fix which lateral body is assumed. The
+profile is supplied from outside it, by the crack [`crack_perp_displacement`](@ref) opens.
 """
 function Res!(F::AbstractVector{_T}, T::AbstractVector{_T}, Δ::NTuple, N::NTuple, BC::NamedTuple, Params::NamedTuple, MatParam) where {_T <: Number}
 

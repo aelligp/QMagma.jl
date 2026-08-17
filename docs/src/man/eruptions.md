@@ -1,7 +1,9 @@
 # Eruptions
 
-The one-dimensional column represents the axis of a sill or chamber with radius `R_sill`
-and area ``A = \pi R_{\mathrm{sill}}^2``. A connected region is considered eruptible where
+The one-dimensional column represents the axis of a sill or chamber with radius `R_sill`.
+It thins away from the axis as a penny-shaped crack, so its plan-view area is
+``A = \tfrac{2}{3}\pi R_{\mathrm{sill}}^2`` ([`lateral_effective_area`](@ref)), not
+``\pi R_{\mathrm{sill}}^2``. A connected region is considered eruptible where
 the melt fraction is ``\phi \geq 0.5`` — equivalently, where the crystal fraction
 ``1-\phi \leq 0.5``. The eruption withdraws bulk magma, including its liquid and entrained
 crystals. A withdrawn bulk-equivalent thickness ``h_{\mathrm{erupt}}`` therefore has volume
@@ -116,10 +118,10 @@ from it when the chamber first appears. Inflation therefore feeds back on the re
 pressurizes more slowly than one that cannot, which is the physical relief path a
 fixed-volume chamber lacks.
 
-In the GUI, `μ shear` sets ``1/\beta_r = 3/(4\mu\varepsilon)``
+In the GUI, `G` sets ``1/\beta_r = 3/(4G\varepsilon)``
 ([`QMagma.host_compliance`](@ref)), the compliance of the host rock alone. The aspect ratio
 ``\varepsilon = \min(V/2R_{\mathrm{sill}}, 1)`` flattens the chamber against a fixed radius:
-an oblate sill is more compliant than the sphere the classical ``3/(4\mu)`` describes, and
+an oblate sill is more compliant than the sphere the classical ``3/(4G)`` describes, and
 recovers it at ``\varepsilon = 1``. Because the chamber's volume is its own state, this is
 re-evaluated each step, so an inflating chamber grows more compliant.
 

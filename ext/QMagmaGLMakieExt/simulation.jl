@@ -17,7 +17,7 @@ function wire_simulation!(ui)
         Sill_interval_top_box, Sill_interval_bot_box,
         Ql_box, menu_conduct, menu_melting, menu_method,
         menu_trigger, menu_collapse, Sill_radius_box,
-        dPc_box, mu_box, mw_box, hmelt_box,
+        dPc_box, G, mw_box, hmelt_box,
         filename, record_toggle,
         time_val, stop_requested, sim_running, zircon_running, last_run, last_matparam,
     ) = ui
@@ -74,11 +74,12 @@ function wire_simulation!(ui)
         collapse_method = menu_collapse.selection[]
         erupt_mode = collapse_method == "Caldera" ? :caldera : :hybrid
         # lateral extent of the sill/chamber the 1D column represents: erupted volumes
-        # are A_sill * bulk erupted thickness
+        # are A_sill * bulk erupted thickness, with A_sill the plan-view area of the
+        # crack-shaped body the column is the axis of
         R_sill = get_valuebox(Sill_radius_box) * 1.0e3          # [m]
-        A_sill = pi * R_sill^2                                # [m^2]
+        A_sill = lateral_effective_area(R_sill)               # [m^2]
         ΔPc = get_valuebox(dPc_box) * 1.0e6                  # critical overpressure [Pa]
-        μ_shear = get_valuebox(mu_box) * 1.0e9                   # host-rock shear modulus [Pa]
+        μ_shear = get_valuebox(G) * 1.0e9                   # host-rock shear modulus [Pa]
         # One lumped chamber state per emplacement model, both reading these parameters.
         # η_r is not among them: step_chamber_eruption! derives it per model from that
         # model's own country-rock T, so the two chambers cannot write through each other.
@@ -350,7 +351,7 @@ function wire_simulation!(ui)
                         T_host = linear_interpolation(z, T)(Sill_z0)
                         injected_step += magma_heat_input(T_host, Tsill, Sillthick, MatParam)
 
-                        T, rocks, magma_lost = insert_sill(T, rocks, z, Sill_thick = Sillthick, Sill_z0 = Sill_z0, Sill_T = Tsill)
+                        T, rocks, magma_lost = insert_sill(T, rocks, z, Sill_thick = Sillthick, Sill_z0 = Sill_z0, Sill_T = Tsill, r = R_sill)
                         magma_in_step += Sillthick
                         magma_out_step += magma_lost
                         Params.Told .= T
@@ -359,7 +360,7 @@ function wire_simulation!(ui)
                             (T = Params.Told .+ 273.15,)
                         )
 
-                        advect_tracers_sill!(tracers, Sill_z0, Sillthick)
+                        advect_tracers_sill!(tracers, Sill_z0, Sillthick; r = R_sill)
                         add_sill_tracers!(tracers, Sill_z0, Sillthick, Tsill)
 
                         crust_added += Sillthick / 1.0e3
@@ -377,7 +378,7 @@ function wire_simulation!(ui)
                     # same physics, but with sills smeared into a steady
                     # volumetric source Q_magma instead of discrete injection events
                     depth_forcing && (zone_markers .= [-source_top * 1.0e3, -source_bot * 1.0e3])
-                    compute_Q_magma!(Params_Q, MatParam, z; Tsill = Tsill, ȧ = ȧ_step, Silltop = source_top, Sillbot = source_bot)
+                    compute_Q_magma!(Params_Q, MatParam, z; Tsill = Tsill, ȧ = ȧ_step, Silltop = source_top, Sillbot = source_bot, r = R_sill)
                     # the injected-magma indicator rides the same host-rock displacement as the
                     # column, then takes this step's smeared delivery spread over the zone
                     rocks_Q_adv = conservative_advection(rocks_Q, Params_Q.w .* Params_Q.Δt, z)
@@ -389,7 +390,7 @@ function wire_simulation!(ui)
                     add_uniform_content!(rocks_Q, z, zone_lo, zone_hi, Δh)
                     magma_in_step_Q += Δh
                     advect_w!(Params_Q)   # semi-Lagrangian host-rock displacement, as with discrete sills
-                    compute_Q_magma!(Params_Q, MatParam, z; Tsill = Tsill, ȧ = ȧ_step, Silltop = source_top, Sillbot = source_bot)
+                    compute_Q_magma!(Params_Q, MatParam, z; Tsill = Tsill, ȧ = ȧ_step, Silltop = source_top, Sillbot = source_bot, r = R_sill)
                     advect_markers!(zone_markers, Params_Q)
                     advect_tracers!(tracers_Q, Params_Q)
                     for _ in 1:n_injections
@@ -725,7 +726,7 @@ function wire_simulation!(ui)
             empty!(last_run)
             last_run[:z] = z
             last_run[:T_background] = T_background
-            last_run[:gaussian_sigma] = R_sill
+            last_run[:R_sill] = R_sill
             last_run[:time_vec] = time_vec
             last_run[:flux_m_per_yr] = flux_vec
             last_run[:flux_mode] = ȧ.mode
@@ -825,7 +826,7 @@ function wire_simulation!(ui)
             QMagma.erupted_tracers_out = run_discrete ? erupted_tracers : erupted_tracers_Q
             QMagma.last_run_out = copy(last_run)
             println("Simulation data available in the REPL: `QMagma.tracers_out` (tracer T-t histories), `QMagma.erupted_tracers_out` (tracers removed by eruption), `QMagma.last_run_out` (profiles, time series, unified eruption_events, cumulative enthalpy_budget, and — for a D&H run — chamber H₂O diagnostics). SAVE DATA writes it all to <filename>.jld2.")
-            println("SAVE JLD2 + VTK also writes Gaussian 2D/3D temperature VTKs for each active model, with σ equal to the sill radius and lateral extent ±3σ.")
+            println("SAVE JLD2 + VTK also writes 2D/3D temperature VTKs for each active model, tapered as a penny-shaped crack of the sill radius R over a lateral extent ±1.5R.")
             println("Compute zircon ages with: `QMagma.compute_zircon_ages(QMagma.tracers_out)`, or click COMPUTE ZIRCON AGES")
         catch err
             @error "Simulation loop failed" exception = (err, catch_backtrace())

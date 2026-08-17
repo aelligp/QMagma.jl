@@ -36,13 +36,17 @@ end
 
             background = [200.0, 100.0, 0.0]
             x = [-2.0, 0.0, 2.0]
-            T2 = QMagma.gaussian_thermal_structure(T, background, x; sigma = 1.0)
+            T2 = QMagma.lateral_thermal_structure(T, background, x; R = 3.0)
             @test T2[2, :] == T
             @test T2[1, :] == T2[3, :]
             tapered_anomaly = abs.(T2[1, :] .- background)
             original_anomaly = abs.(T .- background)
             @test all(tapered_anomaly .<= original_anomaly)
             @test any(tapered_anomaly .< original_anomaly)
+            # outside the body the field is background, with no tail to truncate
+            T2_edge = QMagma.lateral_thermal_structure(T, background, [-4.0, 0.0, 4.0]; R = 3.0)
+            @test T2_edge[1, :] == background
+            @test T2_edge[3, :] == background
             Params, = QMagma.init_model(nz = 3, L = 2.0, Ttop = 0.0, Tbot = 200.0, Δt = 1.0)
             ϕ2 = QMagma.melt_fraction_from_temperature(T2, Params.MatParam)
             @test size(ϕ2) == size(T2)
@@ -55,7 +59,7 @@ end
             @test size(JLD2.load(joinpath(directory, "two.jld2"))["temperature"]) == (3, 3)
 
             y = [-2.0, 0.0, 2.0]
-            T3 = QMagma.gaussian_thermal_structure(T, background, x; y, sigma = 1.0)
+            T3 = QMagma.lateral_thermal_structure(T, background, x; y, R = 3.0)
             @test T3[2, 2, :] == T
             files_3d = QMagma.export_thermal_structure(
                 joinpath(directory, "three"), z;
@@ -277,6 +281,132 @@ end
         @test T_3d[1] ≈ BC.Tbot && T_3d[end] ≈ BC.Ttop         # BCs still enforced
 
         @test_throws "R_lat must be positive" QMagma.init_model(R_lat = 0.0)
+    end
+
+    @testset "lateral profile is the emplaced crack opening" begin
+        R = 5.0e3
+        w(ρ) = QMagma.lateral_profile(ρ, R)
+
+        # Sneddon's penny-shaped crack under uniform pressure
+        @test w(0.0) ≈ 1.0
+        @test w(0.6R) ≈ sqrt(1 - 0.6^2)
+        @test w(R) == 0.0                       # compact support: the body has an edge
+        @test w(1.5R) == 0.0
+        @test w(0.3R) > w(0.7R)                 # thickest on the axis
+
+        # an unbounded body is laterally uniform, the same 1-D limit R_lat = Inf takes
+        @test QMagma.lateral_profile(1.0e9, Inf) ≈ 1.0
+    end
+
+    @testset "the crack that opens is the crack the geometry assumes" begin
+        # the volume convention of the penny-shaped sills in InjectSills.jl and
+        # MagmaThermoKinematics.jl: Q = 2*pi*H*W^2/3 for radius W and axial aperture H
+        for (W, H) in ((5.0e3, 400.0), (1.2e3, 50.0))
+            @test QMagma.lateral_effective_area(W) * H ≈ 2π * H * W^2 / 3
+        end
+
+        # the opening kernel is the Sun (1969) crack: one at the face, and its far field
+        # carries the shape's own decay rather than a disc's solid angle
+        R, ν = 5.0e3, 0.3
+        @test QMagma.crack_perp_shape(0.0, R, ν) ≈ 1.0
+        @test QMagma.crack_perp_shape(1.0e9, R, ν) ≈ 0.0 atol = 1.0e-9
+        @test QMagma.crack_perp_shape(0.5R, R, ν) > QMagma.crack_perp_shape(R, R, ν)
+        @test QMagma.crack_perp_shape(1.0e6, Inf, ν) ≈ 1.0        # unbounded: uniform
+
+        # crack_perp_integral must be the antiderivative of crack_perp_shape
+        for t in (0.3R, R, 4R)
+            n = 20_000
+            quad = sum(QMagma.crack_perp_shape((i - 0.5) * t / n, R, ν) for i in 1:n) * t / n
+            @test QMagma.crack_perp_integral(t, R, ν) ≈ quad rtol = 1.0e-6
+            @test QMagma.crack_perp_integral(-t, R, ν) == QMagma.crack_perp_integral(t, R, ν)
+        end
+    end
+
+    @testset "effective area is the lateral profile integrated over the plane" begin
+        # the area that turns an axial thickness into a volume must be the one the exported
+        # body actually occupies, not the disc πR² it is inscribed in
+        for R in (1.0, 5.0e3, 2.7e4)
+            n = 400_000
+            dr = R / n
+            numeric = sum(QMagma.lateral_profile((i - 0.5) * dr, R) * 2π * (i - 0.5) * dr * dr for i in 1:n)
+            @test QMagma.lateral_effective_area(R) ≈ numeric rtol = 1.0e-6
+            @test QMagma.lateral_effective_area(R) < π * R^2
+        end
+        @test QMagma.lateral_effective_area(3.0) ≈ 2π * 9 / 3
+    end
+
+    @testset "exported body carries the column's anomaly enthalpy" begin
+        # expanding the column must neither create nor destroy the anomaly: the 3-D anomaly
+        # integrated over the plane is the axial anomaly times the effective area
+        R = 4.0e3
+        z = collect(-2.0e3:100.0:0.0)
+        background = fill(300.0, length(z))
+        T = background .+ 400.0 .* exp.(-((z .+ 1.0e3) ./ 400.0) .^ 2)
+
+        n = 2001
+        x = collect(range(-R, R; length = n))
+        T2 = QMagma.lateral_thermal_structure(T, background, x; R)
+        anomaly_2d = T2 .- reshape(background, 1, :)
+        # revolve the 2-D slice: ∫anomaly(r) 2πr dr over r ≥ 0, against the axial anomaly
+        half = (n + 1) ÷ 2
+        r = x[half:end]
+        planar = [sum(anomaly_2d[half:end, k] .* 2π .* r .* step(range(0, R; length = half))) for k in eachindex(z)]
+        @test planar ≈ (T .- background) .* QMagma.lateral_effective_area(R) rtol = 1.0e-3
+    end
+
+    @testset "lateral loss is the axis curvature of the lateral profile" begin
+        # The residual's lateral sink and the shape the model assumes laterally are one
+        # assumption, not two: Hlat is -k times the profile's radial Laplacian on the axis.
+        # Changing the profile without changing the coefficient must fail here.
+        for (R, k) in ((5.0e3, 3.0), (1.2e3, 2.25), (4.0e4, 1.7))
+            w(ρ) = QMagma.lateral_profile(ρ, R)
+            h = R / 1.0e3
+            curvature = 2 * (w(h) - 2w(0.0) + w(h)) / h^2 / w(0.0)   # 2 lateral dimensions
+            @test QMagma.lateral_loss_coefficient(k, R) ≈ -k * curvature rtol = 1.0e-5
+        end
+        @test QMagma.lateral_loss_coefficient(3.0, Inf) == 0.0
+    end
+
+    @testset "sill opening uses the model's sill radius" begin
+        # Advecting a linear profile makes the applied displacement readable off the
+        # temperature field as (T - T_adv)/gradient. At |z| = r the Sun crack shape is
+        # 1 - π/4 + (π/4 - 1/2)/(2(1-ν)), so that crossing locates the radius the opening
+        # actually used. The recovered profile sits one departure point further out than
+        # the analytic one, which is what sets the tolerance.
+        z = collect(-30.0e3:100.0:0.0)
+        grad, z0, thick = 0.02, -15.0e3, 200.0
+        T0 = grad .* (z .+ 30.0e3)
+        rocks = zero(z)
+        ν = 0.3
+        target = (thick / 2) * (1 - π / 4 + (π / 4 - 1 / 2) / (2 * (1 - ν)))
+
+        function opening_radius(T1)
+            applied = (T0 .- T1) ./ grad
+            up = findall(zz -> zz > z0 + 500.0, z)
+            j = findfirst(k -> applied[up[k]] < target, eachindex(up))
+            z1, z2 = z[up[j - 1]], z[up[j]]
+            a1, a2 = applied[up[j - 1]], applied[up[j]]
+            return z1 + (a1 - target) * (z2 - z1) / (a1 - a2) - z0
+        end
+
+        for R in (3.0e3, 5.0e3, 9.0e3)
+            T1, = QMagma.insert_sill(
+                T0, rocks, z; Sill_thick = thick, Sill_z0 = z0, Sill_T = 1200.0, r = R
+            )
+            @test opening_radius(T1) ≈ R rtol = 0.02
+        end
+
+        # a crack of unbounded radius opens uniformly - the constant-displacement limit
+        T_inf, = QMagma.insert_sill(
+            T0, rocks, z; Sill_thick = thick, Sill_z0 = z0, Sill_T = 1200.0, r = Inf
+        )
+        T_const, = QMagma.insert_sill(
+            T0, rocks, z; Sill_thick = thick, Sill_z0 = z0, Sill_T = 1200.0,
+            SillType = :constant
+        )
+        @test T_inf ≈ T_const
+
+        @test_throws "r must be positive" QMagma.insert_sill(T0, rocks, z; r = 0.0)
     end
 
     @testset "shared accretion forcing" begin
@@ -835,7 +965,7 @@ end
             T, rocks, z; Sill_thick = 100.0, Sill_z0 = -15.0e3,
             Sill_T = 1200.0
         )
-        @test h_out == 0.0                              # the pile is nowhere near a boundary
+        @test h_out ≈ 0.0 atol = 1.0e-9                 # the pile is nowhere near a boundary
         gain = QMagma.integrated_content(rocks2, z) - content
         @test gain ≈ 100.0
 
@@ -2117,9 +2247,10 @@ end
 
         @test budget.injected ≈ nt * Δt * ȧ
         @test budget.injected ≈ 600 * Sillthick          # 300 kyr / 500 yr
-        # Nothing reaches the surface at this injection depth.
-        @test budget.withdrawn ≈ 0.0 atol = 1.0e-6
-        @test budget.magma ≈ budget.injected atol = 1.0e-6
+        # The elastic opening reaches the free surface, so a trace of magma leaves through
+        # it - centimetres against the 60 km injected over 600 events.
+        @test budget.withdrawn ≈ 0.0 atol = 1.0e-1
+        @test budget.magma ≈ budget.injected atol = 1.0e-1
         @test budget.residual ≈ 0.0 atol = 1.0e-6
         @test budget.melt_residual > 0
         @test budget.melt_residual < budget.injected

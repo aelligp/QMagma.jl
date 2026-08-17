@@ -215,7 +215,7 @@ equivalent thickness of the liquid held in that band.
 
 This is a storage diagnostic, not the erupted amount. An eruption withdraws the bulk
 mixture, crystals included, so the closure amplitude and the erupted volume
-`A_sill * EruptionEvent.requested` are bulk thicknesses; the liquid fraction of one
+`lateral_effective_area(R_sill) * EruptionEvent.requested` are bulk thicknesses; the liquid fraction of one
 withdrawal is `EruptionEvent.melt_requested`.
 """
 function melt_thickness(ϕ, z, z_lo, z_hi)

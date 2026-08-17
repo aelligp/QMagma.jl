@@ -30,7 +30,9 @@ Params, BC, N, Δ, T, z = QMagma.init_model(;
 MatParam = Params.MatParam
 Params.Told .= T
 
-# Both branches share one accretion history. This example ramps from 0.05 to 0.15 m/yr
+# Both branches share one accretion history. Rates are axial accretion [m/yr]; a
+# volumetric flux converts through lateral_effective_area(R_sill) = (2/3)πR², not πR².
+# This example ramps from 0.05 to 0.15 m/yr
 # between 50 and 150 kyr and injects nothing outside that window; use
 # FluxHistory(:constant; base=0.1/SecYear) for a rate that never stops.
 Params_Q = deepcopy(Params)
@@ -115,16 +117,16 @@ export_thermal_structure("run_1d", z; fields=(temperature=T, melt_fraction=ϕ, r
 ```
 
 A 1D profile becomes a 2D or 3D field by tapering its anomaly from a background profile
-with a Gaussian, [`gaussian_thermal_structure`](@ref). This is what the GUI's
-**SAVE JLD2 + VTK** button does, with σ equal to the sill radius and a lateral extent
-of ±3σ:
+with [`lateral_thermal_structure`](@ref). This is what the GUI's **SAVE JLD2 + VTK** button
+does, with `R` the sill radius and a lateral extent of ±1.5R — the body ends at `R`, so the
+grid runs past its edge:
 
 ```julia
-x  = -15e3:250.0:15e3
-T2 = gaussian_thermal_structure(T, T_background, x; sigma=5e3)
+x  = -7.5e3:250.0:7.5e3
+T2 = lateral_thermal_structure(T, T_background, x; R=5e3)
 export_thermal_structure("run_2d", z; x, fields=(temperature=T2,))
 
-T3 = gaussian_thermal_structure(T, T_background, x; y=x, sigma=5e3)
+T3 = lateral_thermal_structure(T, T_background, x; y=x, R=5e3)
 export_thermal_structure("run_3d", z; x, y=x, fields=(temperature=T3,))
 ```
 

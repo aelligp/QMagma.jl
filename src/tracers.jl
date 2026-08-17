@@ -93,7 +93,7 @@ moves by at most `Sill_thick/2`.
 Use this for the discrete-sill path; `compute_Q_magma!`/`advect_w!` does not displace
 the column this way and should use `advect_tracers!` instead.
 """
-function advect_tracers_sill!(tracers, Sill_z0, Sill_thick; SillType = :elastic, r = 5.0e3)
+function advect_tracers_sill!(tracers, Sill_z0, Sill_thick; SillType = :elastic, r = 5.0e3, ν = 0.3)
     Sill_thick > 0 || throw(ArgumentError("Sill_thick must be positive"))
     SillType in (:constant, :elastic) ||
         throw(ArgumentError("SillType must be :constant or :elastic"))
@@ -105,7 +105,7 @@ function advect_tracers_sill!(tracers, Sill_z0, Sill_thick; SillType = :elastic,
         elseif SillType == :constant
             tracer.z += z_shift > 0 ? Sill_thick / 2 : -Sill_thick / 2
         elseif SillType == :elastic
-            d = crack_perp_displacement(z_shift, Sill_thick / 2; r = r)
+            d = crack_perp_displacement(z_shift, Sill_thick / 2; r, ν)
             tracer.z += z_shift > 0 ? d : -d
         end
     end

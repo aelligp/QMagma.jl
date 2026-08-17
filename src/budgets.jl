@@ -44,9 +44,10 @@ end
     lateral_loss_energy(T, Params, z, Δt) -> E [J/m²]
 
 Net heat the lateral (third-dimension) conduction term exchanges with the far field during
-one timestep, over the same interior nodes as the thermal residual. Negative values cool
-the column; it is identically zero for a purely 1-D model (`R_lat = Inf`). Sign convention
-matches [`conductive_boundary_energy`](@ref), so the two add.
+one timestep, over the same interior nodes as the thermal residual.
+
+Negative values cool the column; identically zero for a purely 1-D model (`R_lat = Inf`).
+Sign convention matches [`conductive_boundary_energy`](@ref), so the two add.
 """
 function lateral_loss_energy(T, Params, z, Δt)
     length(T) == length(z) || throw(DimensionMismatch("T and z must have equal length"))

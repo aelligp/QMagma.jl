@@ -17,20 +17,36 @@ accounts for latent heat released as magma crystallizes.
 
 ## Lateral heat loss
 
-The column is the axis of an axisymmetric body of lateral extent ``R_\mathrm{lat}``, so
-heat also escapes sideways into the crust. The anomaly ``T - T_\mathrm{bg}`` relative to
-the initial geotherm ``T_\mathrm{bg}`` is taken to taper radially as a Gaussian of width
-``R_\mathrm{lat}`` — the same shape [`gaussian_thermal_structure`](@ref) uses to expand a
-profile into 2-D or 3-D — and the radial part of the Laplacian of that Gaussian on the axis
-is ``-2(T - T_\mathrm{bg})/R_\mathrm{lat}^2``. Undisturbed host rock sits at
+The column is the axis of an axisymmetric body of radius ``R_\mathrm{lat}``, so heat also
+escapes sideways into the crust. The anomaly ``T - T_\mathrm{bg}`` relative to the initial
+geotherm ``T_\mathrm{bg}`` tapers radially as [`QMagma.lateral_profile`](@ref), the opening
+``\sqrt{1 - r^2/R_\mathrm{lat}^2}`` of a penny-shaped crack under uniform pressure. Its
+radial Laplacian on the axis is ``-2(T - T_\mathrm{bg})/R_\mathrm{lat}^2``, which is the
+coefficient ``H_\mathrm{lat} = 2k/R_\mathrm{lat}^2``. Undisturbed host rock sits at
 ``T_\mathrm{bg}``, where the term vanishes; a hot chamber loses heat at a rate set by its
 own width, and the correction dominates vertical conduction once ``R_\mathrm{lat}`` falls
 below the chamber thickness.
 
+The coefficient sees only the profile's curvature at ``r=0``: any shape
+``1 - r^2/(2R^2) + O(r^4)`` returns the same ``2k/R^2``, so the energy balance does not by
+itself fix which body is assumed. The emplacement law does.
+[`QMagma.crack_perp_displacement`](@ref) opens that same crack, and
+[`lateral_thermal_structure`](@ref) expands the profile into 2-D or 3-D, so the host-rock
+advection, the heat loss and the exported field describe one body: it displaces
+[`lateral_effective_area`](@ref) ``= \tfrac{2}{3}\pi R^2`` per unit axial aperture, the
+``Q = 2\pi H W^2/3`` convention of the penny-shaped sills in InjectSills.jl and
+MagmaThermoKinematics.jl.
+
 `R_lat = Inf` recovers a purely one-dimensional column. The GUI ties it to the chamber
-radius `R_sill`, the same radius that fixes the chamber's compliance and the export
-Gaussian's ``\sigma``. [`QMagma.lateral_loss_energy`](@ref) books the loss in the enthalpy
-budget alongside the top and bottom boundary fluxes.
+radius `R_sill`, the same radius that fixes the chamber's compliance, the crack the sills
+open, and the body the export draws. [`QMagma.lateral_loss_energy`](@ref) books the loss in
+the enthalpy budget alongside the top and bottom boundary fluxes.
+
+!!! warning "The lateral width is fixed in time"
+    A real anomaly spreads laterally as it diffuses, and the crack profile has a vertical
+    tangent at the tip that smooths immediately. ``H_\mathrm{lat}`` holds the width fixed at
+    ``R_\mathrm{lat}`` for the whole run, so it is a parameterisation whose accuracy at late
+    times has not been tested against an axisymmetric solve.
 
 Material properties ``k``, ``c_p``, ``\rho``, ``\phi`` and ``\partial\phi/\partial T`` come
 from [GeoParams.jl](https://github.com/JuliaGeodynamics/GeoParams.jl) and are functions of

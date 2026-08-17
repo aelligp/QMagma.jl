@@ -69,7 +69,7 @@ function wire_buttons!(ui)
         Sill_interval_top_box, Sill_interval_bot_box,
         Ql_box, menu_conduct, menu_melting, menu_method,
         menu_trigger, menu_collapse, Sill_radius_box,
-        dPc_box, mu_box, mw_box, hmelt_box,
+        dPc_box, G, mw_box, hmelt_box,
         filename, record_toggle,
         time_val, stop_requested, sim_running, zircon_running, last_run, last_matparam,
     ) = ui
@@ -90,9 +90,11 @@ function wire_buttons!(ui)
             vtk_names = String[]
             matparam = last_matparam[]
             isnothing(matparam) && error("No material parameters available for 2D/3D melt-fraction export")
-            sigma = last_run[:gaussian_sigma]
-            x2 = range(-3sigma, 3sigma; length = 41)
-            x3 = range(-3sigma, 3sigma; length = 21)
+            R_sill = last_run[:R_sill]
+            # the body ends at R_sill; the grid runs past it so the edge and some host rock
+            # are in the exported field
+            x2 = range(-1.5R_sill, 1.5R_sill; length = 41)
+            x3 = range(-1.5R_sill, 1.5R_sill; length = 21)
             for (label, temperature_key) in (("discrete", :T), ("Qmagma", :T_Qmagma))
                 haskey(last_run, temperature_key) || continue
                 temperature = last_run[temperature_key]
@@ -112,16 +114,19 @@ function wire_buttons!(ui)
                         )
                     )
                 end
-                T2 = gaussian_thermal_structure(temperature, last_run[:T_background], x2; sigma)
-                T3 = gaussian_thermal_structure(temperature, last_run[:T_background], x3; y = x3, sigma)
+                T2 = lateral_thermal_structure(temperature, last_run[:T_background], x2; R = R_sill)
+                T3 = lateral_thermal_structure(temperature, last_run[:T_background], x3; y = x3, R = R_sill)
                 ϕ2 = melt_fraction_from_temperature(T2, matparam)
                 ϕ3 = melt_fraction_from_temperature(T3, matparam)
                 fields2 = (temperature = T2, melt_fraction = ϕ2)
                 fields3 = (temperature = T3, melt_fraction = ϕ3)
                 if temperature_key === :T
                     rocks = last_run[:rocks]
-                    rocks2 = (abs.(x2) .<= sigma) .* reshape(rocks, 1, :)
-                    rocks3 = ((x3 .^ 2 .+ (x3') .^ 2) .<= sigma^2) .* reshape(rocks, 1, 1, :)
+                    # injected magma thins away from the axis with the same profile as the
+                    # anomaly, so its volume is the one lateral_effective_area converts
+                    rocks2 = lateral_profile.(x2, R_sill) .* reshape(rocks, 1, :)
+                    rocks3 = lateral_profile.(sqrt.(x3 .^ 2 .+ (x3') .^ 2), R_sill) .*
+                        reshape(rocks, 1, 1, :)
                     fields2 = (; fields2..., rocks = rocks2)
                     fields3 = (; fields3..., rocks = rocks3)
                 end
@@ -188,7 +193,7 @@ function wire_buttons!(ui)
                 # Model colors; within a model, the resident reservoir and the erupted
                 # cargo get the cool/warm member of the pair.
                 palette = ((:steelblue, :firebrick), (:seagreen, :darkorange))
-                series = NamedTuple[]
+                groups = Dict{String, Vector{NamedTuple}}()
                 for (i, r) in pairs(results)
                     # Generic keys carry the first (discrete-primary) branch, matching the
                     # rest of `last_run`; the second branch is always Q_magma.
@@ -200,35 +205,48 @@ function wire_buttons!(ui)
                         (last_run[Symbol(:zircon_age_years_erupted, sfx)] = r.cargo_years)
 
                     cool, warm = palette[mod1(i, length(palette))]
-                    push!(series, (; label = "$(r.label) reservoir", ka = r.age_years ./ 1.0e3, color = cool, alpha = 0.4))
+                    group = NamedTuple[]
+                    push!(group, (; label = "$(r.label) reservoir", ka = r.age_years ./ 1.0e3, color = cool, alpha = 0.4))
                     isempty(r.cargo_years) ||
-                        push!(series, (; label = "$(r.label) erupted", ka = r.cargo_years ./ 1.0e3, color = warm, alpha = 0.3))
+                        push!(group, (; label = "$(r.label) erupted", ka = r.cargo_years ./ 1.0e3, color = warm, alpha = 0.3))
                     r.n_cargo > 0 &&
                         println("$(r.label) erupted zircon cargo: $(length(r.cargo_years)) datable ages (of $(r.n_cargo) extracted tracers)")
+                    groups[r.label] = group
                 end
 
-                if !isempty(series)
-                    ub = maximum(maximum(s.ka) for s in series) * 1.05
+                if !isempty(groups)
+                    ub = maximum(maximum(entry.ka) for group in values(groups) for entry in group) * 1.05
+                    # "sill" (discrete) always occupies row 1, "Q_magma" row 2, so the two
+                    # models never share an axis and stay visually comparable.
+                    row_labels = filter(l -> haskey(groups, l), ("sill", "Q_magma"))
 
-                    zircon_fig = Figure(size = (1100, 400))
-                    zircon_ax = Axis(
-                        zircon_fig[1, 1], xlabel = "Zircon age [ka]", ylabel = "Density",
-                        title = "Zircon age distribution"
-                    )
-                    cdf_ax = Axis(
-                        zircon_fig[1, 2], xlabel = "Zircon age [ka]", ylabel = "Cumulative probability [%]",
-                        title = "Zircon age spectrum (ranked order)"
-                    )
-                    for s in series
-                        ns = length(s.ka)
-                        label = "$(s.label) (n=$ns)"
-                        ns > 1 && _zircon_density!(zircon_ax, s.ka, ub, s.color, s.alpha, label)
-                        stairs!(cdf_ax, sort(s.ka), (1:ns) ./ ns .* 100; step = :post, color = s.color, label = label)
+                    zircon_fig = Figure(size = (1100, 400 * length(row_labels)))
+                    density_axes = Axis[]
+                    for (row, label) in enumerate(row_labels)
+                        title = label == "sill" ? "Discrete sills" : "Q_magma"
+                        density_ax = Axis(
+                            zircon_fig[row, 1], xlabel = "Zircon age [ka]", ylabel = "Density",
+                            title = "$title zircon age distribution"
+                        )
+                        cdf_ax = Axis(
+                            zircon_fig[row, 2], xlabel = "Zircon age [ka]", ylabel = "Cumulative probability [%]",
+                            title = "$title zircon age spectrum (ranked order)"
+                        )
+                        for s in groups[label]
+                            ns = length(s.ka)
+                            plabel = "$(s.label) (n=$ns)"
+                            ns > 1 && _zircon_density!(density_ax, s.ka, ub, s.color, s.alpha, plabel)
+                            stairs!(cdf_ax, sort(s.ka), (1:ns) ./ ns .* 100; step = :post, color = s.color, label = plabel)
+                        end
+                        xlims!(density_ax, 0, ub)
+                        ylims!(cdf_ax, 0, 100)
+                        any(length(s.ka) > 1 for s in groups[label]) && axislegend(density_ax)
+                        axislegend(cdf_ax, position = :rb)
+                        push!(density_axes, density_ax)
                     end
-                    xlims!(zircon_ax, 0, ub)
-                    ylims!(cdf_ax, 0, 100)
-                    any(length(s.ka) > 1 for s in series) && axislegend(zircon_ax)
-                    axislegend(cdf_ax, position = :rb)
+                    # Same y-limits (density scale) across rows so peak heights are
+                    # directly comparable, not just the shared x-axis (age, via `ub`).
+                    length(density_axes) > 1 && linkyaxes!(density_axes...)
 
                     # display in its own window first: saving an undisplayed Figure
                     # directly can make GLMakie reuse/reconfigure the main GUI's existing

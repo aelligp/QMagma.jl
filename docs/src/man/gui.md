@@ -55,6 +55,16 @@ SIMULATION**.
 | `Top inj. [km]` | 10 | Top of the injection window |
 | `Bottom inj. [km]` | 20 | Bottom of the injection window |
 
+!!! note "Flux is an axial accretion rate"
+    The flux boxes and the CSV `flux_m_per_yr` column are the accretion rate **on the axis**
+    [m/yr], where the crack is thickest — the aperture one sill delivers per unit time. This
+    is the same quantity the sill-accretion literature quotes in m/yr, but the conversion to
+    a volumetric flux is not ``\pi R^2``: a tapering crack sweeps
+    ``\tfrac{2}{3}\pi R_\mathrm{sill}^2`` per unit axial aperture
+    ([`lateral_effective_area`](@ref)). Studies that model sills as uniform-thickness wafers
+    convert with ``\pi R^2``, so matching a published volumetric flux needs an axial rate
+    **1.5×** their quoted accretion rate.
+
 Both emplacement styles use the same history. Ramp and pulse are *episodes*: `Flux
 start/end` bound the whole injection, and the flux is zero outside them, so sills stop
 arriving at `Flux end`. Ramp flux climbs linearly from the base to the peak across that
@@ -109,8 +119,8 @@ temperature and the geotherm at the chamber's depth
 
 `filename` is the stem used by all output. **SAVE SCREENSHOT** writes `<filename>.png`,
 **SAVE JLD2 + VTK** writes the full run to `<filename>.jld2` plus VTK files for each active
-model - the 1D profiles and Gaussian 2D/3D temperature fields with σ equal to the sill
-radius and a lateral extent of ±3σ (see [Headless runs and export](scripting.md)). The
+model - the 1D profiles and 2D/3D temperature fields tapered as a penny-shaped crack of
+the sill radius R over a lateral extent of ±1.5R (see [Headless runs and export](scripting.md)). The
 `Record movie` toggle records the run to a video file. **COMPUTE ZIRCON AGES** runs
 [`compute_zircon_ages`](@ref) on the tracers of the finished run and plots the age
 spectra of the reservoir and of the erupted cargo, one pair per active injection model
@@ -133,7 +143,7 @@ are stored in `last_run_out` under keys suffixed `_Qmagma`.
 
 Common keys in `last_run_out` include:
 
-- `:z`, `:T_background`, `:gaussian_sigma`, and `:time_vec`
+- `:z`, `:T_background`, `:R_sill`, and `:time_vec`
 - `:tracers`, `:erupted_tracers`, `:eruption_events`, and `:enthalpy_budget` for the
   primary branch
 - `:T`, `:phi`, `:rocks`, `:Tmax_vec`, and `:phimax_vec` when discrete sills run

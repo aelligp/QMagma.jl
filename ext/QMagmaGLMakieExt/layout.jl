@@ -134,7 +134,7 @@ function build_layout(size)
     grid[18, 3:4] = menu_collapse = Menu(fig, options = ["Hybrid", "Caldera"], default = "Hybrid", height = 18, fontsize = 11)
     grid[19, 1:2] = Sill_radius_box = add_textbox(fig, "Sill radius [km]:", 5.0)
     grid[19, 3:4] = dPc_box = add_textbox(fig, "ΔP crit [MPa]:", 20.0)
-    grid[20, 1:2] = mu_box = add_textbox(fig, "μ shear [GPa]:", 10.0)
+    grid[20, 1:2] = G = add_textbox(fig, "G [GPa]:", 10.0)
     grid[20, 3:4] = hmelt_box = add_textbox(fig, "Min. chamber melt [m]:", 500.0)
     grid[21, 1:2] = mw_box = add_textbox(fig, "H₂O [wt%]:", 0.0)
 
@@ -147,7 +147,7 @@ function build_layout(size)
     collapse_enabled = Observable(false)
     bind_textbox_enabled!(Sill_radius_box, radius_enabled)
     bind_textbox_enabled!(dPc_box, pressure_enabled)
-    bind_textbox_enabled!(mu_box, shear_enabled)
+    bind_textbox_enabled!(G, shear_enabled)
     bind_textbox_enabled!(mw_box, water_enabled)
     bind_textbox_enabled!(hmelt_box, water_enabled)
     bind_menu_enabled!(menu_collapse, collapse_enabled)
@@ -189,7 +189,7 @@ function build_layout(size)
         Sill_interval_top_box, Sill_interval_bot_box,
         Ql_box, menu_conduct, menu_melting, menu_method,
         menu_trigger, menu_collapse, Sill_radius_box,
-        dPc_box, mu_box, mw_box, hmelt_box,
+        dPc_box, G, mw_box, hmelt_box,
         filename, record_toggle,
         time_val, stop_requested, sim_running, zircon_running, last_run, last_matparam,
     )

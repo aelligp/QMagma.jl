@@ -30,7 +30,8 @@ Tunable parameters for the 3-phase overpressure trigger. Defaults follow Degruyt
 - `μ_shear`: host-rock shear modulus [Pa]. Chamber compliance is derived from it and the
   chamber shape ([`host_compliance`](@ref)); magma compressibility enters the ODE
   separately as `1/β_m` and must not be folded in here.
-- `R_sill` : chamber radius [m], also the σ of the Gaussian 2-D/3-D export
+- `R_sill` : chamber radius [m], the crack radius sills open against and the extent of the
+  2-D/3-D export ([`lateral_profile`](@ref))
 - `η_r`    : wall relaxation viscosity [Pa·s]
 - `ρ_melt`,`ρ_x`,`ρ_gas`: melt / crystal / gas density laws `ρ(P,T)`. The condensed
   phases are compressible on purpose: with rigid
@@ -240,7 +241,7 @@ Mutable chamber state carried across timesteps: absolute pressure `P`, lithostat
 reference `P_lith`, chamber volume `V`, areal total mass `M`, areal water mass `M_H2O`, gas
 volume fraction `ϕ_g`, and the previous mush (T,ϕ) for the fixed-P density-rate source
 term. Areal inventories use kg/m² because the 1-D chamber volume is a thickness; multiplying
-them by `πR_sill²` gives whole-chamber masses. `h_erupt` is the bulk magma drained by the
+them by `lateral_effective_area(R_sill)` gives whole-chamber masses. `h_erupt` is the bulk magma drained by the
 pressure ODE during the latest thermal step; `h_pending` is drained magma not yet withdrawn
 from the grid because the accumulated thickness is still sub-grid. Both are thicknesses of
 the multi-phase mixture, not of its liquid: the chamber's mass and water ledgers debit an
@@ -474,7 +475,7 @@ and radius `ep.R_sill`:
 
 `3/(4μ)` is the classical result for a *spherical* chamber in an elastic half-space. A
 magma body of this kind is not spherical — the 1-D column is the axis of a sill of lateral
-extent `R_sill`, the same radius the Gaussian 2-D/3-D export uses as its σ — and an oblate
+extent `R_sill`, the same radius the 2-D/3-D export tapers over — and an oblate
 chamber is more compliant than a sphere of equal volume, with the compliance growing as
 `1/ε`. Dividing by the aspect ratio reproduces the sphere exactly at `ε = 1` and carries
 the correct scaling for a flattening sill without introducing a constant to calibrate.
@@ -621,13 +622,16 @@ chamber that accommodates recharge by growing pressurizes more slowly than one t
 **Sub-stepping + internal drain.** Between drains the ODE is linear in ΔP and each sub-step
 advances it exactly (relaxation toward `S·η_r` with time constant `η_r·(1/β_r+1/β_m)`), so
 the sub-stepping resolves the drain rather than keeping the integration stable. Sub-steps
-are sized so ΔP moves ≲0.1·ΔP_crit; a step carrying ΔP far past the threshold would erupt
-more melt than the recharge that came in. Whenever ΔP crosses `ΔP_crit` — and the chamber
-is neither gas-locked nor unable to drive a dike to the surface ([`dike_ascends`](@ref)) —
-the chamber relaxes instantaneously to `ΔP_relax`. The wall follows the elastic path and the
-EOS gives the relaxed `ρV`; the difference from the pre-drain `M` is the erupted mass. Its
-equivalent pre-drain bulk thickness is returned in
-`state.h_erupt` (0 if the chamber only charged); the caller queues it with
+are sized so ΔP moves by at most `0.1 * ΔP_crit`; a step carrying ΔP far past the threshold
+would erupt more melt than the recharge that came in.
+
+A drain fires whenever ΔP crosses `ΔP_crit`, provided the chamber is neither gas-locked nor
+unable to drive a dike to the surface ([`dike_ascends`](@ref)). The chamber then relaxes
+instantaneously to `ΔP_relax`.
+
+The wall follows the elastic path and the EOS gives the relaxed `ρV`; the difference from
+the pre-drain `M` is the erupted mass. Its equivalent pre-drain bulk thickness is returned
+in `state.h_erupt`, and is 0 if the chamber only charged. The caller queues it with
 [`pending_withdrawal!`](@ref) and books an eruption only once it is physically withdrawn.
 """
 function step_overpressure!(
@@ -855,9 +859,9 @@ magma_viscosity(ep::EruptionParams, T_K) =
     max_ascent_length(ΔP, Δρg, η, ep) -> L [m]
 
 How far a dike of half-width `ep.w_dike` travels before it freezes. A dike ascends at
-`v = G w²/(3η)` for driving pressure gradient `G` and solidifies once its thermal boundary
+`v = Δ w²/(3η)` for driving pressure gradient `Δ` and solidifies once its thermal boundary
 layer reaches the wall, after `w²/κ`, so it survives a path `L` only while `L/v < w²/κ`.
-Writing `G = ΔP/L + Δρg` — the chamber overpressure spread over the path, plus the
+Writing `Δ = ΔP/L + Δρg` — the chamber overpressure spread over the path, plus the
 buoyancy gradient — the limiting length solves
 
     L² − (Δρg·c)·L − ΔP·c = 0,    c = w⁴/(3ηκ),
