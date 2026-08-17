@@ -29,10 +29,17 @@ state.
 
 [`QMagma.eruptible_mush`](@ref) returns the largest contiguous region with
 ``\phi \geq`` `ϕ_erupt`; separate lenses are distinct chambers and are never combined.
-Drainage requires a dike that reaches the surface, ``\Delta P + P_{\mathrm{lith}} -
-\rho_{\mathrm{magma}} g |z_c| \geq \sigma_{\mathrm{barrier}}``
-([`QMagma.dike_ascends`](@ref)), tested at the moment of drainage against the overpressure
-that drives the dike. Realizing that drainage on the grid additionally requires:
+Drainage requires a dike that reaches the surface
+([`QMagma.dike_ascends`](@ref)), tested at the moment of drainage. This is a propagation
+test, distinct from any local overpressure threshold: it asks whether the magma pressure
+surviving the ascent still beats a barrier stress,
+
+```math
+\Delta P + P_{\mathrm{lith}} - \rho_{\mathrm{magma}} g |z_c| \geq \sigma_{\mathrm{barrier}},
+```
+
+and, separately, whether the dike arrives before it freezes (below). Realizing that
+drainage on the grid additionally requires:
 
 - at least `5Δz` between the region and either model boundary; and
 - a withdrawal greater than `2Δz`.
@@ -51,20 +58,27 @@ overpressure.
 that column varies by well under a percent — small next to the several hundred kg/m³ of
 magma-crust contrast. The pressure criterion therefore grows with depth and never limits it.
 
-The depth limit comes from the second requirement: the dike must reach the surface before
-it freezes. A dike of half-width ``w`` ascends at ``v = G w^2/(3\eta)`` under the driving
-gradient ``G = \Delta P/L + \Delta\rho g`` and solidifies once its thermal boundary layer
-reaches the wall, after ``w^2/\kappa``. It survives a path ``L`` only while ``L/v <
-w^2/\kappa``, giving the reachable length ([`QMagma.max_ascent_length`](@ref))
+The depth limit comes from the second requirement — the competition Rubin (1995) identified
+as the control on whether a dike escapes its source region at all: it must reach the surface
+before it freezes. A dike of half-width ``w`` opens under the driving pressure gradient
+``\Gamma = \Delta P/L + \Delta\rho g`` — the chamber overpressure spread over the remaining
+path ``L``, plus the buoyancy contrast between magma and crust — and ascends at
+``v = \Gamma w^2/(3\eta)``. Heat meanwhile conducts from the dike into the wall rock with
+diffusivity ``\kappa``, and the dike freezes shut once that thermal boundary layer has grown
+to the dike's own half-width, after a time ``\sim w^2/\kappa``. So it only survives the
+remaining path ``L`` while the transit time beats the freezing time, ``L/v < w^2/\kappa``;
+substituting ``v`` and solving for the largest ``L`` still satisfying this gives the
+reachable length ([`QMagma.max_ascent_length`](@ref)) as the positive root of
 
 ```math
 L^2 - (\Delta\rho g\, c) L - \Delta P\, c = 0, \qquad c = \frac{w^4}{3\eta\kappa}.
 ```
 
-The ``w^4`` and the ``1/\eta`` do the work. With `w_dike` = 1 m a basalt dike clears any
-crustal depth, while a silicic one freezes within a few km unless it is wider or hotter —
-which is why silicic eruptions tap shallow storage and basalts do not have to. `EruptionParams.melt_viscosity` selects
-the composition; the default is the basalt parameterisation.
+``c`` carries ``w^4/\eta``, so the reachable length is extremely sensitive to both: with
+`w_dike` = 1 m a basalt dike clears any crustal depth, while a silicic one — far more
+viscous — freezes within a few km unless it is wider or hotter, which is why silicic
+eruptions tap shallow storage and basalts do not have to. `EruptionParams.melt_viscosity`
+selects the composition; the default is the basalt parameterisation.
 
 ## Trigger
 
@@ -166,9 +180,14 @@ on whether a chamber stores or erupts — shallow chambers sit in crust too cold
 so pressurize to failure, deep ones relax and accumulate.
 
 The pressure calculation is substepped, up to 10,000 substeps per thermal step. Whenever
-the chamber reaches ``\Delta P_c``, has gas volume fraction below `ϕ_g_crit`, and can drive
+the chamber reaches `ΔP_crit`, has gas volume fraction below `ϕ_g_crit`, and can drive
 a dike to the surface ([`QMagma.dike_ascends`](@ref)), pressure returns to `ΔP_relax` along
-an instantaneous elastic path. The erupted mass is the difference between the pre-drain
+an instantaneous elastic path. The three are independent gates, not redundant restatements
+of each other: `ΔP_crit` is a local roof-failure threshold on the chamber's own overpressure,
+while `dike_ascends` is a separate, depth-dependent test of whether a dike that *does*
+nucleate can still cross ``\sigma_{\mathrm{barrier}}`` and outrun freezing on the way up —
+clearing one does not imply clearing the other. The erupted mass is the difference between
+the pre-drain
 inventory and ``\rho V`` in that relaxed state; dividing it by the pre-drain bulk density
 gives the equivalent thickness passed to the 1-D withdrawal.
 [`QMagma.pending_withdrawal!`](@ref) accumulates drained melt until more than `2Δz` can be
