@@ -501,7 +501,7 @@ end
         @test QMagma.sills_due(0.0, delivered, 100.0) == 4
         @test mod(delivered, 100.0) ≈ 25.5
 
-        # malformed tables name the offending source line. A single unparseable leading row
+        # malformed tables name the offending source line. A single unparsable leading row
         # is the header and is skipped; anything after it is data and must parse.
         mktemp() do path, io
             write(io, "time_kyr,flux_m_per_yr\n0,0.1\n10,0.3,0.5,1.0\n")
