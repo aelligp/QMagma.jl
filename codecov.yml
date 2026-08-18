@@ -1,0 +1,13 @@
+# The GLMakie GUI layer is driven by user interaction with a live window and is
+# not exercised by the test suite; coverage tracks the solver and export layers.
+ignore:
+  - "ext/QMagmaGLMakieExt/"
+
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true

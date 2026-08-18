@@ -1,0 +1,37 @@
+{
+  "title": "QMagma.jl: A Julia package for 1D thermal modeling of repeated sill injection",
+  "description": "QMagma.jl is a one-dimensional thermal model of repeated sill injection. It compares discrete sill emplacement with an equivalent, time-averaged Q_magma source, tracking melt fraction, passive tracers, eruptions, and zircon crystallization ages, with a GLMakie graphical interface.",
+  "creators": [
+    {
+      "name": "Aellig, Pascal S.",
+      "affiliation": "Johannes Gutenberg University Mainz, Germany",
+      "orcid": "https://orcid.org/0009-0008-9039-5646"
+    },
+    {
+      "name": "Kaus, Boris J.P.",
+      "affiliation": "Johannes Gutenberg University Mainz, Germany",
+      "orcid": "https://orcid.org/0000-0002-0247-8660"
+    }
+  ],
+  "keywords": [
+    "Julia",
+    "Magmatic Systems",
+    "Geodynamics",
+    "Numerical Modeling",
+    "1D Sill Injection",
+    "GUI"
+  ],
+  "grants": [
+    {"id": "10.13039/501100000780::771143"}
+  ],
+  "license": {
+    "id": "MIT"
+  },
+  "upload_type": "software",
+  "access_right": "open",
+  "communities": [
+    {
+      "identifier": "juliapackage"
+    }
+  ]
+}
