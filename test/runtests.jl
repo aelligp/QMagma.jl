@@ -1,10 +1,14 @@
 using QMagma
-using GLMakie          # loads QMagmaGLMakieExt, so the GUI testset exercises it
 using GeoParams
 using JLD2
 using LinearAlgebra, SparseArrays, SparseDiffTools
 using Random
 using Test
+
+# Loading any Makie backend activates QMagmaMakieExt, so the GUI testset exercises it.
+# CairoMakie renders in software, so the layout and wiring are testable without the OpenGL
+# context (and hence display) that the GLMakie backend of the shipped app requires.
+using CairoMakie
 
 const SecYear = 3600 * 24 * 365.25
 
@@ -2306,14 +2310,18 @@ end
         @test QMagma.__init__(devnull) === nothing
     end
 
-    # GUI internals belong to the GLMakie extension. The core test environment does not
-    # load that weak dependency; if a caller has loaded it, test through the extension
-    # module rather than pretending the symbols belong to QMagma itself.
+    # GUI internals belong to the Makie extension. Without that weak dependency the symbols
+    # do not exist at all; where a backend is loaded, test through the extension module
+    # rather than pretending they belong to QMagma itself.
     @testset "GUI layout and wiring" begin
-        ext = Base.get_extension(QMagma, :QMagmaGLMakieExt)
+        ext = Base.get_extension(QMagma, :QMagmaMakieExt)
         if ext === nothing
             @test_throws "sill_intrusion_1D requires GLMakie" QMagma.sill_intrusion_1D()
         else
+            # The app itself needs GLFW, which only GLMakie provides, so under any other
+            # backend it must refuse before opening a window.
+            @test_throws "requires the GLMakie backend" ext.sill_intrusion_1D()
+
             ui = ext.build_layout((1200, 800))
             @test ext.get_valuebox(ui.Δz_box) == 20
             @test ui.menu_trigger.selection[] == "None"

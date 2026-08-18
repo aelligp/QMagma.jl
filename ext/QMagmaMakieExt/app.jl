@@ -1,6 +1,15 @@
 # Entry point of the interactive app: window sizing, wiring and display.
 
-function set_qmagma_window_icon!(screen)
+# Widgets and plots are backend-agnostic Makie, but the window icon, placement and the
+# initial relayout nudge go through GLFW, which only the GLMakie backend exposes.
+function glmakie_backend()
+    backend = Makie.current_backend()
+    backend isa Module && nameof(backend) === :GLMakie ||
+        error("sill_intrusion_1D requires the GLMakie backend; run `using GLMakie` first")
+    return backend
+end
+
+function set_qmagma_window_icon!(GL, screen)
     path = normpath(@__DIR__, "..", "..", "docs", "src", "assets", "favicon.ico")
     isfile(path) || error("QMagma window icon not found at $path")
     if Sys.isapple()
@@ -29,25 +38,26 @@ function set_qmagma_window_icon!(screen)
             app, set_icon, image
         )
     else
-        image = GLMakie.Makie.FileIO.load(path)
+        image = Makie.FileIO.load(path)
         slices = ndims(image) == 2 ? (image,) : eachslice(image; dims = 3)
         icons = [reinterpret(NTuple{4, UInt8}, Matrix(slice)) for slice in slices]
-        GLMakie.GLFW.SetWindowIcon(screen.glscreen, icons)
-        GLMakie.GLFW.PollEvents()
+        GL.GLFW.SetWindowIcon(screen.glscreen, icons)
+        GL.GLFW.PollEvents()
     end
     return nothing
 end
 
 function sill_intrusion_1D(; size = nothing)
-    GLMakie.activate!()
-    GLMakie.closeall() # close any open screen
+    GL = glmakie_backend()
+    GL.activate!()
+    GL.closeall() # close any open screen
 
     if size === nothing
         win_w = 1500
         win_h = 900
         try
-            monitor = GLMakie.GLFW.GetPrimaryMonitor()
-            vidmode = GLMakie.GLFW.GetVideoMode(monitor)
+            monitor = GL.GLFW.GetPrimaryMonitor()
+            vidmode = GL.GLFW.GetVideoMode(monitor)
             # GetVideoMode reports the full screen height; subtract a fixed margin for
             # the menu bar/dock/title bar (not otherwise queryable here) rather than a
             # percentage, since the menu bar's height doesn't scale with screen size
@@ -63,28 +73,28 @@ function sill_intrusion_1D(; size = nothing)
     wire_simulation!(ui)
 
     screen = display(ui.fig; title = "QMagma")
-    set_qmagma_window_icon!(screen)
+    set_qmagma_window_icon!(GL, screen)
 
     # center the window on the primary monitor
     try
-        monitor = GLMakie.GLFW.GetPrimaryMonitor()
-        vidmode = GLMakie.GLFW.GetVideoMode(monitor)
+        monitor = GL.GLFW.GetPrimaryMonitor()
+        vidmode = GL.GLFW.GetVideoMode(monitor)
         win_w, win_h = size
         x = max(0, div(vidmode.width - win_w, 2))
         y = max(0, div(vidmode.height - win_h, 2))
-        GLMakie.GLFW.SetWindowPos(screen.glscreen, x, y)
+        GL.GLFW.SetWindowPos(screen.glscreen, x, y)
     catch e
         @warn "Could not center the window automatically" exception = e
     end
 
-    # Force GLMakie's resize-driven relayout once: the bottom chamber panel (a nested
+    # Force the backend's resize-driven relayout once: the bottom chamber panel (a nested
     # GridLayout in the figure's 2nd row, added after the 1st row) is otherwise not measured
     # until the user manually resizes, so it renders off-window on first display. Nudging the
     # window size by 1px and back fires the resize callback that recomputes the whole layout.
     try
         win_w, win_h = size
-        GLMakie.GLFW.SetWindowSize(screen.glscreen, win_w, win_h - 1)
-        GLMakie.GLFW.SetWindowSize(screen.glscreen, win_w, win_h)
+        GL.GLFW.SetWindowSize(screen.glscreen, win_w, win_h - 1)
+        GL.GLFW.SetWindowSize(screen.glscreen, win_w, win_h)
     catch e
         @warn "Could not nudge the window size to force the initial relayout" exception = e
     end

@@ -19,17 +19,20 @@ ZirconGrowth = "5085b5e1-578a-4bbf-9dfc-2862bf7461c3"
 
 [weakdeps]
 GLMakie = "e9467ef8-e4e7-5192-8a1a-b1aee30e663a"
+Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
 
 [extensions]
-QMagmaGLMakieExt = "GLMakie"
+QMagmaMakieExt = "Makie"
 
 [compat]
+CairoMakie = "0.15"
 ForwardDiff = "0.10, 1"
 GLMakie = "0.13"
 GeoParams = "0.7.18"
 Interpolations = "0.15, 0.16"
 JLD2 = "0.6.4"
 LinearAlgebra = "1"
+Makie = "0.24"
 Random = "1"
 SparseArrays = "1"
 SparseDiffTools = "2"
@@ -41,8 +44,8 @@ ZirconGrowth = "0.1.1"
 julia = "1.10"
 
 [extras]
-GLMakie = "e9467ef8-e4e7-5192-8a1a-b1aee30e663a"
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["GLMakie", "Test"]
+test = ["CairoMakie", "Test"]

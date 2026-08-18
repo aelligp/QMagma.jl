@@ -1,8 +1,8 @@
-module QMagmaGLMakieExt
+module QMagmaMakieExt
 
-using GLMakie
-import GLMakie.Makie.MathTeXEngine as MTE
-GLMakie.update_theme!(fonts = (regular = MTE.texfont(), bold = MTE.texfont(:bold), italic = MTE.texfont(:italic)))
+using Makie
+import Makie.MathTeXEngine as MTE
+Makie.update_theme!(fonts = (regular = MTE.texfont(), bold = MTE.texfont(:bold), italic = MTE.texfont(:italic)))
 
 # Mirrors the `using` block of QMagma itself: the app code was written against that
 # namespace, and an extension does not inherit it.
@@ -36,4 +36,4 @@ include("callbacks.jl")
 include("simulation.jl")
 include("app.jl")
 
-end # module QMagmaGLMakieExt
+end # module QMagmaMakieExt

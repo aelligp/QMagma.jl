@@ -39,10 +39,11 @@ in pixels; if `nothing` (default), it's chosen automatically to fit within the p
 monitor's available height, since a fixed pixel height can be taller than some screens
 (clipping the bottom of the control panel) and there's no scrollable layout to fall back on.
 
-The implementation lives in a package extension, so `GLMakie` must be loaded first.
+The implementation lives in a package extension triggered by `Makie`, and its window
+management needs the `GLMakie` backend, so `GLMakie` must be loaded first.
 """
 function sill_intrusion_1D(; kwargs...)
-    ext = Base.get_extension(@__MODULE__, :QMagmaGLMakieExt)
+    ext = Base.get_extension(@__MODULE__, :QMagmaMakieExt)
     ext === nothing &&
         error("sill_intrusion_1D requires GLMakie; run `using GLMakie` first")
     return ext.sill_intrusion_1D(; kwargs...)

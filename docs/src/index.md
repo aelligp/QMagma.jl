@@ -68,8 +68,8 @@ QMagma.jl builds on
   (conductivity, heat capacity, density, melting parameterisations, latent heat)
 * [ZirconGrowth.jl](https://github.com/aelligp/ZirconGrowth.jl) - zircon crystal growth
   along a cooling path
-* [GLMakie.jl](https://github.com/MakieOrg/Makie.jl) - the interactive interface, loaded
-  on demand through a package extension
+* [GLMakie.jl](https://github.com/MakieOrg/Makie.jl) - the interactive interface, built on
+  a Makie package extension loaded on demand
 * [WriteVTK.jl](https://github.com/JuliaVTK/WriteVTK.jl) and
   [JLD2.jl](https://github.com/JuliaIO/JLD2.jl) - output
 ## Quick start

@@ -251,7 +251,7 @@ function wire_buttons!(ui)
                     # display in its own window first: saving an undisplayed Figure
                     # directly can make GLMakie reuse/reconfigure the main GUI's existing
                     # screen instead of opening an independent one, replacing it on-screen.
-                    display(GLMakie.Screen(), zircon_fig; title = "Zircon Ages")
+                    display(glmakie_backend().Screen(), zircon_fig; title = "Zircon Ages")
 
                     zircon_name = filename[2].stored_string.val * "_zircon_ages.png"
                     save(zircon_name, zircon_fig)

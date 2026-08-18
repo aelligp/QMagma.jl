@@ -17,7 +17,7 @@ function set_textbox_enabled!(box, enabled)
     textbox.boxcolor_focused = enabled ? :transparent : (:gray, 0.15)
     textbox.bordercolor = enabled ? (:gray, 0.8) : (:gray, 0.45)
     textbox.bordercolor_hover = enabled ? (:gray, 0.55) : (:gray, 0.45)
-    enabled || GLMakie.Makie.defocus!(textbox)
+    enabled || Makie.defocus!(textbox)
     return nothing
 end
 
@@ -27,7 +27,7 @@ function bind_textbox_enabled!(box, enabled)
         set_textbox_enabled!(box, active)
     end
     on(textbox.focused) do focused
-        !enabled[] && focused && GLMakie.Makie.defocus!(textbox)
+        !enabled[] && focused && Makie.defocus!(textbox)
     end
     set_textbox_enabled!(box, enabled[])
     return nothing

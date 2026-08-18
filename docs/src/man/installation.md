@@ -21,8 +21,9 @@ using QMagma
 ```
 
 !!! info "The GUI lives in a package extension"
-    GLMakie is a weak dependency. [`sill_intrusion_1D`](@ref) throws until `GLMakie` is
-    loaded as well:
+    Makie is a weak dependency and the app is built from backend-agnostic widgets, but
+    window placement and the window icon go through GLFW, which only the GLMakie backend
+    provides. [`sill_intrusion_1D`](@ref) errors until `GLMakie` is loaded as well:
 
     ```julia
     using QMagma, GLMakie
