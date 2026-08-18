@@ -1,7 +1,8 @@
 module QMagmaGLMakieExt
 
-using GLMakie, MathTeXEngine
-GLMakie.update_theme!(fonts = (regular = texfont(), bold = texfont(:bold), italic = texfont(:italic)))
+using GLMakie
+import GLMakie.Makie.MathTeXEngine as MTE
+GLMakie.update_theme!(fonts = (regular = MTE.texfont(), bold = MTE.texfont(:bold), italic = MTE.texfont(:italic)))
 
 # Mirrors the `using` block of QMagma itself: the app code was written against that
 # namespace, and an extension does not inherit it.
