@@ -5,7 +5,7 @@
 [![Version](https://img.shields.io/github/v/release/aelligp/QMagma.jl?label=version&sort=semver)](https://github.com/aelligp/QMagma.jl/releases)
 [![Docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://aelligp.github.io/QMagma.jl/dev/)
 [![CI](https://github.com/aelligp/QMagma.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/aelligp/QMagma.jl/actions/workflows/CI.yml)
-[![codecov](https://codecov.io/gh/aelligp/QMagma.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/aelligp/QMagma.jl)
+[![codecov](https://codecov.io/gh/aelligp/QMagma.jl/graph/badge.svg?token=8TD9XOQI0P)](https://codecov.io/gh/aelligp/QMagma.jl)
 
 QMagma.jl is a one-dimensional thermal model of repeated sill injection. It compares
 discrete sill emplacement with an equivalent, time-averaged `Q_magma` source. Both models
