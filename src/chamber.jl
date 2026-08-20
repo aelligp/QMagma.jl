@@ -372,6 +372,18 @@ function chamber_water_fraction(state::EruptionState, fallback)
     return m_w
 end
 
+"""
+    project_mass_constraint!(state, ep, T_K, ϕ_mush, m_w, inv_βr) -> ρ [kg/m³]
+
+Newton-solve chamber pressure and volume for `ρ(P) V(P) == state.M`, writing `P`, `V`, and
+the closing `mass_residual` into `state` and returning the mixture density.
+
+The chamber compresses along the host's compliance `inv_βr = 1/βr`, so
+`V = V₀ exp((P - P₀)/βr)`, and the magma along its own compressibility from
+[`mixture_density`](@ref), differentiated with ForwardDiff. Their sum must be positive for
+the step to descend; a gas law below its [`gas_pressure_floor`](@ref) makes it negative and
+throws an error. Steps that would drive `P` nonpositive are halved instead.
+"""
 function project_mass_constraint!(state, ep, T_K, ϕ_mush, m_w, inv_βr)
     P0, V0 = state.P, state.V
     P = P0
