@@ -113,12 +113,10 @@ function validate_eruption_params(ep::EruptionParams)
             "ρ_melt and ρ_x must give positive densities at the reference state"
         )
     )
-    if !iszero(ep.m_w)
-        ρ_g_ref = gas_density(ep, 2.0e8, 1123.15)
-        isfinite(ρ_g_ref) && ρ_g_ref > 0 || throw(
-            DomainError(ρ_g_ref, "ρ_gas must give a positive density at the reference state")
-        )
-    end
+    # Exercise the gas law at a representative reservoir state. `gas_density` already
+    # rejects a nonpositive or out-of-range result on every call, so the state only has to
+    # be evaluated here, not re-checked.
+    iszero(ep.m_w) || gas_density(ep, 2.0e8, 1123.15)
     ep.G_act >= 0 || throw(ArgumentError("G_act must be nonnegative"))
     ρ_c = crust_reference_density(ep)
     isfinite(ρ_c) && ρ_c > 0 ||
@@ -147,8 +145,60 @@ melt_density(ep::EruptionParams, P, T_K) = compute_density(ep.ρ_melt, (; P, T =
 @doc (@doc melt_density)
 crystal_density(ep::EruptionParams, P, T_K) = compute_density(ep.ρ_x, (; P, T = T_K))
 
-@doc (@doc melt_density)
-gas_density(ep::EruptionParams, P, T_K) = compute_density(ep.ρ_gas, (; P, T = T_K))
+"""
+    gas_pressure_floor(law, T_K) -> P [Pa]
+
+Lowest pressure at which a gas-density law still increases with pressure; zero for a law
+that has no such limit.
+
+`RedlichKwong_Density` carries the Huber et al. (2010) H₂O parameterization, which is an
+empirical power law rather than the Redlich–Kwong equation it is named for. Its `ω^-1.135`
+term diverges as `P → 0` instead of approaching the ideal gas, so the fit has a spurious
+density minimum. Below that minimum `∂ρ_g/∂P < 0`: decompression makes the gas denser,
+which drives the mixture compressibility `1/β_m` negative and leaves the chamber's
+mass-constraint solve ([`project_mass_constraint!`](@ref)) without a descent direction.
+Solving `∂ρ/∂ω = 0` for `ω = P/Pref` and `τ = (T - T0)/Tref` gives
+
+    ω_min = (1.135 a₂ / (0.033 a₃) · τ^0.411)^(1/1.168)
+
+which is 23–27 MPa between 700 and 1100 °C. Coefficients come from the law rather than
+being written out here, so a refit moves the floor with it.
+"""
+gas_pressure_floor(::AbstractDensity, T_K) = zero(float(T_K))
+
+function gas_pressure_floor(law::RedlichKwong_Density, T_K)
+    _, a2, a3 = law.coeffs
+    τ = (T_K - NumValue(law.T0)) / NumValue(law.Tref)
+    τ > 0 || throw(
+        DomainError(T_K, "gas temperature must exceed the law's reference temperature")
+    )
+    return NumValue(law.Pref) * (1.135 * a2 / (0.033 * a3) * τ^0.411)^(1 / 1.168)
+end
+
+"""
+    gas_density(ep::EruptionParams, P, T_K) -> ρ_g [kg/m³]
+
+Exsolved-H₂O density from `ep.ρ_gas`, refusing any state its law cannot represent: a
+pressure below [`gas_pressure_floor`](@ref), where the density decreases with pressure, and
+a nonpositive density, which the Huber fit returns near its minimum above ~1050 °C. Both
+are rejected rather than clamped — a clamp would return a plausible number and silently
+corrupt `ϕ_g`, the compressibility, and every eruption volume derived from them.
+"""
+function gas_density(ep::EruptionParams, P, T_K)
+    P_floor = gas_pressure_floor(ep.ρ_gas, T_K)
+    P >= P_floor || throw(
+        DomainError(
+            P,
+            "pressure is below the $(P_floor) Pa validity floor of " *
+                "$(nameof(typeof(ep.ρ_gas))) at $(T_K) K, where ∂ρ_g/∂P < 0"
+        )
+    )
+    ρ_g = compute_density(ep.ρ_gas, (; P, T = T_K))
+    ρ_g > 0 || throw(
+        DomainError(ρ_g, "gas density law returned a nonpositive density at $(P) Pa, $(T_K) K")
+    )
+    return ρ_g
+end
 
 """
     condensed_density(ep::EruptionParams, P, T_K, ϕ_melt) -> ρ_c [kg/m³]

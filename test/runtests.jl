@@ -175,11 +175,39 @@ end
         @test_throws "must give positive densities" QMagma.validate_eruption_params(
             QMagma.EruptionParams(ρ_melt = ConstantDensity(ρ = -1kg / m^3))
         )
-        @test_throws "ρ_gas must give a positive density" QMagma.validate_eruption_params(
+        @test_throws "gas density law returned a nonpositive density" QMagma.validate_eruption_params(
             QMagma.EruptionParams(
                 m_w = 0.05, ρ_gas = ConstantDensity(ρ = -1kg / m^3)
             )
         )
+        # The Huber et al. (2010) H2O fit has a spurious density minimum: below it the gas
+        # gets denser as it decompresses, which flips the sign of the mixture
+        # compressibility and leaves the chamber mass solve without a descent direction.
+        # The floor is where the fit's own pressure derivative vanishes.
+        let ep = QMagma.EruptionParams(m_w = 0.04)
+            floor_900 = QMagma.gas_pressure_floor(ep.ρ_gas, 1173.15)
+            @test 25.0e6 < floor_900 < 25.7e6
+            # rises with temperature, and stays inside the 23-27 MPa band over magmatic T
+            @test QMagma.gas_pressure_floor(ep.ρ_gas, 973.15) < floor_900
+            @test 23.0e6 < QMagma.gas_pressure_floor(ep.ρ_gas, 973.15) < 27.5e6
+            # the derivative really does vanish there, and is negative just below
+            dρ = QMagma.ForwardDiff.derivative(
+                P -> compute_density(ep.ρ_gas, (; P, T = 1173.15)), floor_900
+            )
+            @test isapprox(dρ, 0, atol = 1.0e-7)
+            @test QMagma.ForwardDiff.derivative(
+                P -> compute_density(ep.ρ_gas, (; P, T = 1173.15)), 0.5floor_900
+            ) < 0
+
+            @test QMagma.gas_density(ep, 1.0e8, 1173.15) > 0
+            @test_throws "below the" QMagma.gas_density(ep, 0.5floor_900, 1173.15)
+            # above ~1050 C the fit returns a negative density just above the pressure
+            # floor, so positivity is a separate check rather than a consequence of it
+            @test_throws "nonpositive density" QMagma.gas_density(ep, 2.8e7, 1373.15)
+            # a law without a low-pressure pathology gets no floor imposed on it
+            @test QMagma.gas_pressure_floor(ConstantDensity(ρ = 500kg / m^3), 1173.15) == 0
+        end
+
         @test_throws "rtol must be nonnegative" QMagma.check_density_consistency(
             Params.MatParam, ep; rtol = -1.0
         )

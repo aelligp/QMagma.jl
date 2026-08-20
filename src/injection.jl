@@ -69,9 +69,14 @@ function compute_Q_magma!(Params, MatParam, z; Tsill, ȧ, Silltop, Sillbot, r = 
     H = (Sillbot - Silltop) * 1.0e3
 
     Params.Q .= 0.0
-    ind = findall(zbot .<= z .<= ztop)
+    # Overlap widths sum to `H` by construction, so ∑ Q Δz = ρₘ ȧ [...] exactly whatever the
+    # alignment - the discrete form of the ∫Q dz the smearing is defined by - and interior
+    # cells of a well-resolved zone still get the full ρₘ ȧ/H [...].
+    widths = interval_cell_widths(z, zbot, ztop)
+    cells = diff(grid_cell_edges(z))
+    ind = findall(>(0.0), widths)
     isempty(ind) && throw(ArgumentError("injection zone contains no grid points"))
-    Params.Q[ind] .= Params.ρ[ind] .* (ȧ / H) .* (Params.Cp[ind] .* (Tsill .- Params.Told[ind]) .+ Q_L .* (1.0 .- Params.ϕ[ind]))
+    Params.Q[ind] .= (widths[ind] ./ cells[ind]) .* Params.ρ[ind] .* (ȧ / H) .* (Params.Cp[ind] .* (Tsill .- Params.Told[ind]) .+ Q_L .* (1.0 .- Params.ϕ[ind]))
 
     Params.w .= mean_sill_velocity(z, ȧ, zbot, ztop; r, ν)
 
