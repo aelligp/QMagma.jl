@@ -173,6 +173,10 @@ simulated tracer:
 
 - `age_years`: volume-averaged crystallisation age [yr] (see [`volume_averaged_age`](@ref))
 - `zircon_radius_um`: final crystal radius [µm]
+- `tracer_index`: index into `tracers` of each entry above, so an age can be tied back to
+  the tracer that grew it - the offset to the common clock is `(t_ref_Myr -
+  tracers[i].time_vec[end]) * 1e6`, and subtracting it recovers the age the crystal had
+  when its history stopped
 
 Skipped tracers: fewer than 2 recorded time steps, never hotter than `T_zr_min` [°C]
 (too cold to ever grow zircon - saves the expensive simulation and keeps fake zero-age
@@ -231,13 +235,14 @@ function compute_zircon_ages(
         return_results && (_results[i] = res)
     end
 
+    tracer_index = Int[i for i in eachindex(age_years) if !isnothing(age_years[i])]
     age_years = Float64[v for v in age_years        if !isnothing(v)]
     zircon_radius_um = Float64[v for v in zircon_radius_um if !isnothing(v)]
 
     if return_results
         results = ZirconGrowth.SimulationResult[r for r in _results if !isnothing(r)]
-        return (; age_years, zircon_radius_um, results)
+        return (; age_years, zircon_radius_um, tracer_index, results)
     end
 
-    return (; age_years, zircon_radius_um)
+    return (; age_years, zircon_radius_um, tracer_index)
 end

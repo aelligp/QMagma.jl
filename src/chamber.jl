@@ -664,10 +664,11 @@ explicitly as an independent audit:
 Here the inventories are per unit sill area [kg/m²]. Magma entering or leaving through a
 moving `ϕ ≥ ϕ_erupt` margin is recorded separately in `M_boundary`; it is a control-volume
 boundary flux, not recharge. The state water fraction is always `M_H2O/M`, so phase
-partitioning cannot silently create or destroy water. A relative disagreement greater than
-0.5 % between the independent inventory and `ρV` aborts the step. Smaller integration
-error is removed by an elastic Newton correction of `(P,V)` onto `M = ρV`; `M` itself is
-never overwritten by the equation-of-state result.
+partitioning cannot silently create or destroy water. `M` is checked against its own flux
+ledger `M_initial + M_in - M_out + M_boundary` at the top of every step, and a relative
+disagreement above `1e-10` aborts. Integration error between `M` and `ρV` is removed by an
+elastic Newton correction of `(P,V)` onto `M = ρV`; `M` itself is never overwritten by the
+equation-of-state result.
 
 **Chamber volume.** `V_e` is the mush extent the grid currently shows; `state.V` is the
 chamber's own volume, and it is what the ODE uses. The mechanical rate
