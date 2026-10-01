@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-label="QMagma.jl logo: a Computer Modern Q as a magma chamber beneath a layered crust">
+  <defs>
+    <linearGradient id="melt" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffcf3f"/>
+      <stop offset="0.5" stop-color="#f2711c"/>
+      <stop offset="1" stop-color="#b5231f"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Crust: surface plus the stratigraphy the sills intrude into -->
+  <g stroke="#8b93a1" stroke-linecap="round" fill="none">
+    <path d="M16 40H186" stroke-width="7"/>
+    <g stroke-width="3.5" opacity="0.5">
+      <path d="M16 64H74"/><path d="M126 64H186"/>
+      <path d="M16 92H36"/><path d="M166 92H186"/>
+      <path d="M16 150H30"/><path d="M172 150H186"/>
+      <path d="M16 176H52"/><path d="M150 176H186"/>
+    </g>
+  </g>
+
+  <!-- Conduit from the chamber roof through the surface -->
+  <path d="M95 70h11l-4 -44h-3z" fill="#f2711c"/>
+
+  <!-- Chamber: Q set in Latin Modern (Computer Modern) bold -->
+  <path d="M153.2 163.3C153.2 162.2 153.2 159.6 150.6 159.6C148.4 159.6 148.1 161.5 148.0 162.5C147.1 167.9 138.2 168.1 135.8 168.1C132.5 168.1 128.2 168.1 122.6 159.6C146.1 150.4 152.3 129.1 152.3 113.5C152.3 82.4 131.5 62.0 99.6 62.0C66.7 62.0 46.7 83.3 46.7 113.5C46.7 142.8 66.2 163.8 99.6 163.8C102.7 163.8 107.5 163.6 113.2 162.5C117.3 178.7 120.1 190.1 133.5 190.1C148.1 190.1 153.2 173.1 153.2 163.3ZM131.2 113.3C131.2 121.4 131.2 142.8 117.4 152.3C114.2 147.5 109.1 139.9 99.4 139.9C92.1 139.9 85.5 144.8 85.5 151.7C85.5 152.6 85.6 154.2 85.9 154.9C68.3 146.4 67.8 124.6 67.8 113.3C67.8 107.6 67.8 93.9 73.1 83.7C80.6 69.9 93.0 67.8 99.4 67.8C107.2 67.8 118.4 70.7 125.3 82.9C130.8 92.5 131.2 104.9 131.2 113.3ZM111.4 155.7C107.8 157.3 103.5 158.0 99.6 158.0C91.7 158.0 90.7 153.4 90.7 151.7C90.7 147.8 94.8 145.1 99.6 145.1C103.6 145.1 108.5 146.7 111.4 155.7Z" fill="url(#melt)"/>
+
+  <!-- Stacked sills, in the Julia colors -->
+  <g>
+    <ellipse cx="100" cy="98" rx="15" ry="4.5" fill="#389826"/>
+    <ellipse cx="98" cy="112" rx="19" ry="5" fill="#cb3c33"/>
+    <ellipse cx="102" cy="126" rx="12" ry="4" fill="#9558b2"/>
+  </g>
+</svg>
