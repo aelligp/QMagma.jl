@@ -9,7 +9,7 @@ using SpecialFunctions: erf
 
 export sill_intrusion_1D, compute_zircon_ages, volume_averaged_age
 export export_thermal_structure, lateral_thermal_structure, melt_fraction_from_temperature
-export lateral_effective_area
+export lateral_effective_area, run_Q_forward
 
 # Physics and numerics, in dependency order.
 include("grid.jl")
@@ -20,6 +20,7 @@ include("eruption.jl")
 include("chamber.jl")
 include("budgets.jl")
 include("tracers.jl")
+include("forward.jl")
 include("export.jl")
 include("controls.jl")
 

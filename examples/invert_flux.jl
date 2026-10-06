@@ -31,8 +31,8 @@
 # Outputs (in --out): best_flux_history.csv (readable by QMagma.load_flux_history),
 # ensemble.csv (every forward model tried, ensemble and polish) and summary.txt.
 
-include(joinpath(@__DIR__, "forward_Qmagma.jl"))
-using Optim, Random, Statistics
+using QMagma, GeoParams, Optim, Random, Statistics
+using QMagma: SecYear, FluxHistory, EruptionParams, run_Q_forward
 
 # ─── Fixed model set-up (not fitted) ──────────────────────────────────────────────────────
 # Coarser than the GUI defaults (Δz = 20 m, Δt = 100 yr, 2 tracers per sill) so that one

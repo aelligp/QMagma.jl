@@ -132,3 +132,25 @@ export_thermal_structure("run_3d", z; x, y=x, fields=(temperature=T3,))
 
 Use `formats=(:vtk,)` or `formats=(:jld2,)` to write only one of the two. The returned
 vector lists every file written.
+
+## Q\_magma forward model and flux inversion
+
+[`run_Q_forward`](@ref) runs the Q\_magma branch headlessly, with tracers, optional
+eruptions and zircon ages, and keeps all state local so many models can be run from one
+session:
+
+```julia
+using QMagma
+SecYear = QMagma.SecYear
+ȧ = QMagma.FluxHistory(:ramp; base=0.05/SecYear, peak=0.15/SecYear,
+                       t_start=50e3SecYear, t_end=150e3SecYear)
+res = run_Q_forward(ȧ)                       # no eruptions
+res.ages.age_years                           # zircon ages [yr before the end of the run]
+```
+
+Pass `eruption=EruptionParams(...)` to switch the D&H eruption trigger on; the erupted
+cargo ages are then in `res.ages_erupted`.
+
+`examples/invert_flux.jl` wraps it in a Latin-hypercube + Nelder–Mead inversion of a
+piecewise-linear flux history against a zircon age distribution. See the header of that
+file for options and for the limits on what a narrow age distribution can constrain.
