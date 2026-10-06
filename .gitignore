@@ -44,3 +44,5 @@ archive/*
 
 # Output of examples/invert_flux.jl
 examples/inversion_out/
+examples/mcmc_out/
+examples/data_private/
