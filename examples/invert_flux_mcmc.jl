@@ -13,7 +13,10 @@
 #                          synthetic truth is generated and recovered (twin test).
 #   --nwalkers=N           ensemble size, even and >= 2*7 (default 48)
 #   --nsteps=N             generations to run (default 300)
-#   --sigma=S              age error [ka] in the likelihood (default 2.5)
+#   --sigma=S              age error [ka] in the likelihood (default 2.5); overridden by a
+#                          per-age error column in --data (second column, e.g. sigma_ka)
+#   --preset=unzen         Unzen/Heisei set-up: 1055 °C recharge into 8-12 km, silicic melting
+#                          law (see `unzen_overrides`)
 #   --out=DIR              output directory (default examples/mcmc_out)
 #   --hires=N              after sampling, re-run N random posterior draws with the
 #                          full-resolution (GUI default) model and compare (default 24; 0 = skip)
@@ -41,6 +44,35 @@ using DelimitedFiles
 
 # GUI-default resolution, used for the synthetic data and for checking posterior draws
 const HIRES_MODEL = (; Δz = 20.0, Δt_yr = 100.0, nt = 3000, tracers_per_sill = 2, nx_zircon = 50)
+
+# Unzen (Heisei 1990-95) set-up, from the compiled literature: recharge 1055 ± 75 °C (Holtz et
+# al. 2005), injection into the 8-12 km low-Vs zone beneath Fugendake (Miyano et al. 2021;
+# pressure sources 7-13 km, Nakada et al. 1999; de Silva: storage centred at 8 km). The silicic
+# melting law is the only one whose liquidus (1059 °C) lies above the recharge temperature.
+unzen_overrides() = (;
+    Tsill = 1055.0, Silltop = 8.0, Sillbot = 12.0,
+    melting = QMagma.gui_composition("MeltingParam_Rhyolite").melting,
+)
+
+"""
+    load_ages_sigma(path) -> (ages, sigmas)
+
+Read `age_ka[, sigma_ka, ...]` rows (a header line is skipped). `sigmas` is `nothing` when the
+file has a single column.
+"""
+function load_ages_sigma(path)
+    ages, sig = Float64[], Float64[]
+    for line in eachline(path)
+        f = split(strip(line), [',', ' ', '\t'], keepempty = false)
+        (isempty(f) || startswith(f[1], '#')) && continue
+        a = tryparse(Float64, f[1])
+        a === nothing && (isempty(ages) ? continue : error("non-numeric age in $path: $line"))
+        push!(ages, a)
+        length(f) >= 2 && (v = tryparse(Float64, f[2]); v !== nothing && push!(sig, v))
+    end
+    isempty(ages) && error("no ages found in $path")
+    return ages, length(sig) == length(ages) ? sig : nothing
+end
 
 const AGE_RANGE_KA = 300.0         # support of the outlier component
 const OUTLIER_FRACTION = 0.01
@@ -176,15 +208,18 @@ compare their log-likelihood with the coarse model's. Writes `hires_check.csv`
 Draws whose likelihood drops a lot at full resolution mark where the coarse model misleads.
 """
 function hires_check(
-        out; n = 24, burn = 0.4, eruptions = false, population = :reservoir, sigma = 2.5, seed = 5
+        out; n = 24, burn = 0.4, eruptions = false, population = :reservoir, sigma = 2.5, seed = 5,
+        overrides = (;)
     )
     data = readdlm(joinpath(out, "chain.csv"), ',', skipstart = 1)
     step, P = Int.(data[:, 1]), data[:, 4:end]
     ok = step .>= round(Int, burn * (maximum(step) + 1))
     idx = findall(ok)
     pick = idx[randperm(MersenneTwister(seed), length(idx))[1:min(n, length(idx))]]
-    observed = vec(readdlm(joinpath(out, "observed_ages_ka.csv")))
-    extra = eruptions ? eruption_setup() : (;)
+    obs_file = readdlm(joinpath(out, "observed_ages_ka.csv"), ',')
+    observed = vec(Float64.(obs_file[:, 1]))
+    size(obs_file, 2) >= 2 && (sigma = vec(Float64.(obs_file[:, 2])))     # per-age errors
+    extra = merge(eruptions ? eruption_setup() : (;), overrides)
     coarse = merge(BASE_MODEL, extra, (; seed = 1, nx_zircon = 20, zircon_tracers = 3))
     fine = merge(BASE_MODEL, extra, HIRES_MODEL, (; seed = 1))
 
@@ -218,7 +253,8 @@ end
 function run_mcmc(;
         eruptions = false, population = :reservoir, data = nothing, nwalkers = 48,
         nsteps = 300, sigma = 2.5, out = joinpath(@__DIR__, "mcmc_out"), seed = 3,
-        resume = false, hires = 24, truth = [-1.3, -1.0, -0.6, -0.3, -0.8, -1.5, -2.0]
+        resume = false, hires = 24, truth = [-1.3, -1.0, -0.6, -0.3, -0.8, -1.5, -2.0],
+        overrides = (;)
     )
     population in (:reservoir, :erupted, :both) || error("population must be :reservoir, :erupted or :both")
     eruptions || population === :reservoir || error("population = $population needs eruptions")
@@ -226,7 +262,7 @@ function run_mcmc(;
     iseven(nwalkers) && nwalkers >= 2d || error("nwalkers must be even and >= $(2d)")
     mkpath(out)
 
-    extra = eruptions ? eruption_setup() : (;)
+    extra = merge(eruptions ? eruption_setup() : (;), overrides)
     fine = merge(BASE_MODEL, extra, HIRES_MODEL, (; seed = 1))        # data + final check
     cheap = merge(BASE_MODEL, extra, (; seed = 1, nx_zircon = 20, zircon_tracers = 3))  # sampler
 
@@ -235,9 +271,10 @@ function run_mcmc(;
         observed = synthetic_observations(truth, fine; population)   # full-resolution model
         writedlm(joinpath(out, "truth.csv"), truth', ',')
     else
-        observed = load_ages(data)
+        observed, file_sigma = load_ages_sigma(data)
+        file_sigma === nothing || (sigma = file_sigma)            # per-grain analytical errors
     end
-    writedlm(joinpath(out, "observed_ages_ka.csv"), observed)
+    writedlm(joinpath(out, "observed_ages_ka.csv"), sigma isa Number ? observed : [observed sigma], ',')
     println("$(length(observed)) observed ages, median $(round(median(observed), digits = 1)) ka; $(Threads.nthreads()) thread(s)")
 
     logpost = p -> logposterior(p, observed, cheap, sigma, population)
@@ -281,7 +318,7 @@ function run_mcmc(;
         )
     end
     summarize(out)
-    hires > 0 && hires_check(out; n = hires, eruptions, population, sigma)
+    hires > 0 && hires_check(out; n = hires, eruptions, population, sigma, overrides)
     return nothing
 end
 
@@ -295,6 +332,7 @@ function parse_mcmc_args(args)
             startswith(a, "--data=") ? (opts[:data] = a[8:end]) :
             startswith(a, "--nwalkers=") ? (opts[:nwalkers] = parse(Int, a[12:end])) :
             startswith(a, "--nsteps=") ? (opts[:nsteps] = parse(Int, a[10:end])) :
+            startswith(a, "--preset=") ? (opts[:preset] = a[10:end]) :
             startswith(a, "--hires=") ? (opts[:hires] = parse(Int, a[9:end])) :
             startswith(a, "--sigma=") ? (opts[:sigma] = parse(Float64, a[9:end])) :
             startswith(a, "--out=") ? (opts[:out] = a[7:end]) :
@@ -310,9 +348,13 @@ if abspath(PROGRAM_FILE) == @__FILE__
         summarize(out)
         get(opts, :hires, 24) > 0 && hires_check(
             out; n = get(opts, :hires, 24), eruptions = get(opts, :eruptions, false),
-            population = get(opts, :population, :reservoir), sigma = get(opts, :sigma, 2.5)
+            population = get(opts, :population, :reservoir), sigma = get(opts, :sigma, 2.5),
+            overrides = get(opts, :preset, "") == "unzen" ? unzen_overrides() : (;)
         )
     else
-        run_mcmc(; Base.structdiff(opts, (; summarize = true))...)
+        preset = get(opts, :preset, "")
+        preset in ("", "unzen") || error("unknown preset $preset")
+        overrides = preset == "unzen" ? unzen_overrides() : (;)
+        run_mcmc(; Base.structdiff(opts, (; summarize = true, preset = ""))..., overrides)
     end
 end

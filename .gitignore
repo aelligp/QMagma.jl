@@ -46,3 +46,4 @@ archive/*
 examples/inversion_out/
 examples/mcmc_out/
 examples/data_private/
+examples/mcmc_unzen/

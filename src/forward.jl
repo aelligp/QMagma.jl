@@ -2,6 +2,8 @@
 # (ext/QMagmaMakieExt/simulation.jl) without plotting, with all state local so many models
 # can be run from one session (e.g. for an inversion, see examples/invert_flux.jl).
 
+const INIT_LOCK = ReentrantLock()
+
 """
     run_Q_forward(ȧ; kwargs...) -> NamedTuple
 
@@ -40,13 +42,17 @@ function run_Q_forward(
     Δt = Δt_yr * SecYear
     nz = round(Int, H * 1.0e3 / Δz) + 1
     Tbot = Ttop + H * γ
-    Params, BC, N, Δ, T, z = init_model(;
-        nz, L = H * 1.0e3, Geotherm = γ, Ttop, Tbot, Δt, R_lat = R_sill,
-        ρ = 2700.0, Q_L,
-        Conductivity = ConstantConductivity(k = 3.0),
-        HeatCapacity = ConstantHeatCapacity(),
-        Melting = melting
-    )
+    # GeoParams interns the material name in a global, non-thread-safe table, so concurrent
+    # model set-up (an ensemble over threads) must be serialised; the time loop is thread-safe.
+    Params, BC, N, Δ, T, z = lock(INIT_LOCK) do
+        init_model(;
+            nz, L = H * 1.0e3, Geotherm = γ, Ttop, Tbot, Δt, R_lat = R_sill,
+            ρ = 2700.0, Q_L,
+            Conductivity = ConstantConductivity(k = 3.0),
+            HeatCapacity = ConstantHeatCapacity(),
+            Melting = melting
+        )
+    end
     MatParam = Params.MatParam
     Params.Told .= T
     T_background = copy(T)
