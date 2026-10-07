@@ -1,0 +1,10 @@
+[deps]
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+GeoParams = "e018b62d-d9de-4a26-8697-af89c310ae38"
+Optim = "429524aa-4258-5aef-a3af-852621145aeb"
+QMagma = "8cfc6f19-fbd9-4880-a4f1-905e8e77e9a2"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+SparseDiffTools = "47a9eef4-7e08-11e9-0b38-333d64bd3804"
+
+[sources]
+QMagma = {path = ".."}
