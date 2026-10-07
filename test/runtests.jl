@@ -2376,4 +2376,24 @@ end
         end
     end
 
+    @testset "run_Q_forward" begin
+        ȧ = QMagma.FluxHistory(
+            :ramp; base = 0.05 / SecYear, peak = 0.3 / SecYear,
+            t_start = 20.0e3SecYear, t_end = 100.0e3SecYear
+        )
+        kw = (; Δz = 100.0, Δt_yr = 250.0, nt = 480, tracers_per_sill = 1, nx_zircon = 20)
+        res = run_Q_forward(ȧ; kw...)
+        @test length(res.T) == length(res.z)
+        # the seeded tracers record every step; later ones only from their injection on
+        @test all(tr -> length(tr.time_vec) == kw.nt, res.tracers[1:20])
+        @test all(tr -> length(tr.time_vec) <= kw.nt, res.tracers)
+        @test isempty(res.erupted) && res.ages_erupted === nothing
+        @test !isempty(res.ages.age_years)
+        # ages are measured back from the end of the run
+        @test all(0 .<= res.ages.age_years .<= kw.nt * kw.Δt_yr + 1)
+        # deterministic, and zircon = false skips the age computation
+        @test run_Q_forward(ȧ; kw...).ages.age_years == res.ages.age_years
+        @test !haskey(run_Q_forward(ȧ; kw..., nt = 20, zircon = false), :ages)
+    end
+
 end

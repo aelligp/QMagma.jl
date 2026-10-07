@@ -132,3 +132,24 @@ export_thermal_structure("run_3d", z; x, y=x, fields=(temperature=T3,))
 
 Use `formats=(:vtk,)` or `formats=(:jld2,)` to write only one of the two. The returned
 vector lists every file written.
+
+## Headless Q\_magma runs
+
+[`run_Q_forward`](@ref) runs the Q\_magma branch without any plotting and keeps all state local, so
+many models can be run from one session or in parallel. It follows the same steps as the GUI loop and
+returns the final tracer populations, the eruption events and, optionally, the zircon ages:
+
+```julia
+using QMagma
+SecYear = QMagma.SecYear
+ȧ = QMagma.FluxHistory(:ramp; base=0.05/SecYear, peak=0.15/SecYear,
+                       t_start=50e3SecYear, t_end=150e3SecYear)
+res = run_Q_forward(ȧ)                       # no eruptions
+res.ages.age_years                           # zircon ages [yr before the end of the run]
+```
+
+Pass `eruption=EruptionParams(...)` to switch the eruption trigger on; the ages of the erupted cargo
+are then in `res.ages_erupted`. Further options start the run from a spun-up thermal state
+(`spinup_kyr`, `spinup_rate`, or a temperature profile `T_init`), feed several emplacement zones
+(`zones`, a list of `(top_km, bottom_km, fraction)`), and set the number and depth range of the
+host-rock tracers (`host_tracers`, `tracer_window`).
